@@ -22,9 +22,18 @@ class ExecutionEngine:
         self.risk_engine = risk_engine
 
     def _generate_client_order_id(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> str:
-        # Make deterministic based on intent, so retrying the exact same intent yields the same CID.
-        # This prevents duplicate orders on retry.
-        unique_string = f"{symbol}_{side}_{quantity}_{price}_{self.risk_engine.get_time()}"
+        # Make deterministic based on intent and the number of PRIOR terminal orders matching this intent.
+        # This prevents duplicate orders on retry (because the active order count wouldn't change if the previous failed to submit),
+        # but allows new identical intents if a previous one filled or was canceled.
+        intents = self.persistence.get_all_intents()
+        terminal_count = sum(1 for i in intents
+                             if i["symbol"] == symbol
+                             and i["side"] == side
+                             and Decimal(i["quantity"]) == quantity
+                             and Decimal(i["price"]) == price
+                             and i["status"] in ("FILLED", "CANCELED", "REJECTED"))
+
+        unique_string = f"{symbol}_{side}_{quantity}_{price}_{terminal_count}"
         hashed = hashlib.sha256(unique_string.encode('utf-8')).hexdigest()[:20]
         return f"APGE_{hashed}"
 
@@ -44,6 +53,17 @@ class ExecutionEngine:
             return None
 
         cid = self._generate_client_order_id(symbol, proposal.side, proposal.quantity, proposal.price)
+
+        # If we already have an active intent with this CID, it means we are retrying a submission
+        # that perhaps returned UNKNOWN and we are now trying again?
+        # Actually, if it's UNKNOWN, the system is in RECONCILING so we wouldn't reach here.
+        # But if it's identical intent, we just return the CID if it exists to avoid re-submitting duplicate to adapter.
+        existing_intent = self.persistence.get_intent(cid)
+        if existing_intent:
+            logger.info(f"Intent {cid} already exists locally. Skipping submission to avoid duplicates.")
+            # Consume the approval anyway so it doesn't hang around, but we don't submit.
+            self.risk_engine.consume_approval_and_submit(approval, cid, symbol=symbol, side=proposal.side)
+            return cid
 
         # 2. Consume approval atomically with order creation in risk engine
         if not self.risk_engine.consume_approval_and_submit(approval, cid, symbol=symbol, side=proposal.side):

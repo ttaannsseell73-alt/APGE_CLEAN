@@ -187,8 +187,8 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
     runtime.current_inventory = Decimal("0.0")
     runtime.run_grid_cycle(
         grid_spacing=Decimal("1.0"),
-        base_size=Decimal("1.0"),
-        level_count=3,
+        base_size=Decimal("5.0"), # Max size per level
+        level_count=1,
         max_inventory=Decimal("5.0"),
         system_state=SystemState.OPERATIONAL,
         market_regime=MarketRegime.NEUTRAL,
@@ -196,20 +196,21 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
     )
 
     intents1 = db.get_active_intents()
-    assert len(intents1) == 6
+    assert len(intents1) == 2 # 1 BUY, 1 SELL
 
     for intent in intents1:
         execution_engine.risk_engine.resolve_order(intent["client_order_id"], OrderState.OPEN, Decimal("0.0"))
 
-    # 2. Simulate a BUY fill increasing inventory to 1.0
-    runtime.current_inventory = Decimal("1.0")
+    # 2. Simulate a BUY fill increasing inventory to 5.0 (max long)
+    runtime.current_inventory = Decimal("5.0")
 
-    # And run cycle again.
-    # The grid will shift due to inventory=1.0. A new SELL order (counter exposure) should be proposed to reduce it.
+    # Run cycle again.
+    # We are max long, so no new BUYs should be proposed. The old BUY should be canceled.
+    # SELL capacity increases to 5.0 + 5.0 = 10.0. The strategy proposes SELL up to allowed capacity.
     runtime.run_grid_cycle(
         grid_spacing=Decimal("1.0"),
-        base_size=Decimal("1.0"),
-        level_count=3,
+        base_size=Decimal("5.0"),
+        level_count=1,
         max_inventory=Decimal("5.0"),
         system_state=SystemState.OPERATIONAL,
         market_regime=MarketRegime.NEUTRAL,
@@ -217,14 +218,20 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
     )
 
     intents2 = db.get_active_intents()
-    # At inventory 0: Sells were at 102, 103, 104.
-    # At inventory 1.0: Sells can handle 102, 103, 104, plus now we might be able to sell at 101 or similar depending on the exact math
-    # Let's just verify it correctly computes new/different SELLs.
-    old_sells = {Decimal(i["price"]) for i in intents1 if i["side"] == "SELL"}
-    new_sells = {Decimal(i["price"]) for i in intents2 if i["side"] == "SELL"}
 
-    # Since current_inventory affects max_inventory bounds, the exact number might be same,
-    # but the grid strategy definitely considers the new inventory.
-    # Actually, grid strategy generates counter orders based on allowed capacity.
-    # So if we were max long, it would generate 0 buys and X sells. Let's just ensure we ran the cycle cleanly with updated inventory.
-    assert runtime.current_inventory == Decimal("1.0")
+    # Check that inventory was updated
+    assert runtime.current_inventory == Decimal("5.0")
+
+    buys = [i for i in intents2 if i["side"] == "BUY"]
+    sells = [i for i in intents2 if i["side"] == "SELL"]
+
+    # No BUY orders because we are at max long inventory
+    assert len(buys) == 0
+
+    # There should be SELL orders representing the counter exposure
+    assert len(sells) > 0
+    total_sell_qty = sum(Decimal(s["quantity"]) for s in sells)
+
+    # Old sell quantity was 5.0. It should now have the ability to sell 5.0 (which it does because base_size is 5.0 and level_count is 1)
+    assert total_sell_qty == Decimal("5.0")
+    assert Decimal(sells[0]["price"]) == Decimal("102.0")

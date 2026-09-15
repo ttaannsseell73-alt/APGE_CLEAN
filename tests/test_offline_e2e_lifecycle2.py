@@ -121,12 +121,37 @@ def test_deterministic_client_order_id(engine_setup):
     engine, db = engine_setup
 
     # 1. Ask for a CID for a specific intent
-    engine.risk_engine._get_time_override = 1000.0 # Force time to be static for identical requests
-    def mock_get_time(): return engine.risk_engine._get_time_override
-    engine.risk_engine.get_time = mock_get_time
-
     cid1 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
-    cid2 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
 
+    # 2. Time has passed, state hasn't changed. Should get EXACT SAME CID.
+    cid2 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
     assert cid1 == cid2
     assert cid1.startswith("APGE_")
+
+    # 3. If we submit it, the execution engine should catch the duplicate on retry
+    proposal = OrderProposal("BUY", Decimal("100.0"), Decimal("1.0"))
+    engine.execute_proposal("BTCUSDT", proposal)
+
+    # The mock returns UNKNOWN, making the system RECONCILING. Let's resolve it to OPEN so we can submit again.
+    engine.risk_engine.system_state = SystemState.OPERATIONAL
+    engine.risk_engine.resolve_order(cid1, OrderState.OPEN, Decimal("0.0"))
+    db.update_intent_status(cid1, OrderState.OPEN, "ext1", "NEW")
+
+    # Now it's active. Generating again should still give same CID.
+    cid3 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
+    assert cid1 == cid3
+
+    # Executing the exact same proposal again should NOT call submit_limit_order (mock would throw or count)
+    # The execute_proposal method logs "Skipping submission to avoid duplicates" and returns cid.
+    # Note: execute_proposal consumes the approval FIRST. So if it gets skipped, the approval is thrown away.
+    # It must return the CID. Let's try it.
+    cid4 = engine.execute_proposal("BTCUSDT", proposal)
+    assert cid4 == cid1
+
+    # Intents table should still only have 1 row
+    assert len(db.get_all_intents()) == 1
+
+    # 4. If we mark it terminal, we get a NEW CID so we can trade again at this level
+    db.update_intent_status(cid1, OrderState.FILLED, "ext1", "FILLED")
+    cid5 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
+    assert cid5 != cid1
