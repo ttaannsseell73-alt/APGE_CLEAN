@@ -1,0 +1,2 @@
+nautilus_trader==1.231.0
+pytest
