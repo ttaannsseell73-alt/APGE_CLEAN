@@ -25,12 +25,20 @@ class BinanceAdapter:
     """Binance USD-M Futures TESTNET exchange adapter."""
 
     def __init__(self, transport: Transport, http_url: str, ws_url: str, api_key: str, api_secret: str, clock=None):
-        http_hostname = urllib.parse.urlparse(http_url).hostname
-        ws_hostname = urllib.parse.urlparse(ws_url).hostname
+        parsed_http = urllib.parse.urlparse(http_url)
+        parsed_ws = urllib.parse.urlparse(ws_url)
 
-        if http_hostname != "testnet.binancefuture.com":
+        if parsed_http.scheme != "https":
+            raise ValueError(f"Invalid HTTP URL scheme: {http_url}. Must be https.")
+        if parsed_ws.scheme != "wss":
+            raise ValueError(f"Invalid WS URL scheme: {ws_url}. Must be wss.")
+
+        if parsed_http.username or parsed_http.password or parsed_ws.username or parsed_ws.password:
+            raise ValueError("URL userinfo spoofing is forbidden.")
+
+        if parsed_http.hostname != "testnet.binancefuture.com":
             raise ValueError(f"Invalid HTTP URL: {http_url}. TESTNET ONLY.")
-        if ws_hostname != "stream.binancefuture.com":
+        if parsed_ws.hostname != "fstream.binancefuture.com":
             raise ValueError(f"Invalid WS URL: {ws_url}. TESTNET ONLY.")
 
         self.transport = transport

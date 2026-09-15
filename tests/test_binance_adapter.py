@@ -39,7 +39,7 @@ def test_rejects_invalid_urls():
         BinanceAdapter(
             transport,
             http_url="https://fapi.binance.com",
-            ws_url="wss://stream.binancefuture.com",
+            ws_url="wss://fstream.binancefuture.com",
             api_key="test",
             api_secret="test"
         )
@@ -59,7 +59,7 @@ def test_rejects_invalid_urls():
         BinanceAdapter(
             transport,
             http_url="https://example.com",
-            ws_url="wss://stream.binancefuture.com",
+            ws_url="wss://fstream.binancefuture.com",
             api_key="test",
             api_secret="test"
         )
@@ -69,7 +69,7 @@ def test_rejects_invalid_urls():
         BinanceAdapter(
             transport,
             http_url="https://testnet.binancefuture.com.malicious.com",
-            ws_url="wss://stream.binancefuture.com",
+            ws_url="wss://fstream.binancefuture.com",
             api_key="test",
             api_secret="test"
         )
@@ -79,7 +79,47 @@ def test_rejects_invalid_urls():
         BinanceAdapter(
             transport,
             http_url="https://testnet.binancefuture.com",
-            ws_url="wss://stream.binancefuture.com.malicious.com",
+            ws_url="wss://fstream.binancefuture.com.malicious.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Scheme Validation HTTP
+    with pytest.raises(ValueError, match="Must be https"):
+        BinanceAdapter(
+            transport,
+            http_url="http://testnet.binancefuture.com",
+            ws_url="wss://fstream.binancefuture.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Scheme Validation WS
+    with pytest.raises(ValueError, match="Must be wss"):
+        BinanceAdapter(
+            transport,
+            http_url="https://testnet.binancefuture.com",
+            ws_url="ws://fstream.binancefuture.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Userinfo Spoofing HTTP
+    with pytest.raises(ValueError, match="spoofing is forbidden"):
+        BinanceAdapter(
+            transport,
+            http_url="https://user:pass@testnet.binancefuture.com",
+            ws_url="wss://fstream.binancefuture.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Userinfo Spoofing WS
+    with pytest.raises(ValueError, match="spoofing is forbidden"):
+        BinanceAdapter(
+            transport,
+            http_url="https://testnet.binancefuture.com",
+            ws_url="wss://user:pass@fstream.binancefuture.com",
             api_key="test",
             api_secret="test"
         )
@@ -88,7 +128,7 @@ def test_rejects_invalid_urls():
     adapter = BinanceAdapter(
         transport,
         http_url="https://testnet.binancefuture.com",
-        ws_url="wss://stream.binancefuture.com",
+        ws_url="wss://fstream.binancefuture.com",
         api_key="test",
         api_secret="test"
     )
@@ -100,7 +140,7 @@ def test_deterministic_signature():
     adapter = BinanceAdapter(
         transport,
         http_url="https://testnet.binancefuture.com",
-        ws_url="wss://stream.binancefuture.com",
+        ws_url="wss://fstream.binancefuture.com",
         api_key="test_key",
         api_secret="test_secret",
         clock=lambda: 1600000000.0
@@ -114,7 +154,9 @@ def test_deterministic_signature():
     signed = adapter._prepare_signed_params(params)
     assert "signature" in signed
     assert str(signed["timestamp"]) == "1600000000000"
-    assert len(signed["signature"]) == 64
+
+    # Expected signature for 'side=BUY&symbol=BTCUSDT&timestamp=1600000000000' with secret 'test_secret'
+    assert signed["signature"] == "089d540da47c537acd66eaccd06b5f46eb4f4f8d9af211e57d8069f50bb4fb61"
 
     # Ensure original params were not mutated
     assert "timestamp" not in params
@@ -123,7 +165,7 @@ def _setup_adapter(transport: MockTransport) -> BinanceAdapter:
     return BinanceAdapter(
         transport,
         http_url="https://testnet.binancefuture.com",
-        ws_url="wss://stream.binancefuture.com",
+        ws_url="wss://fstream.binancefuture.com",
         api_key="test_key",
         api_secret="test_secret"
     )
