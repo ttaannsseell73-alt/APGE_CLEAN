@@ -74,6 +74,9 @@ def generate_grid_proposals(
         allowed_long_capacity = max(Decimal('0'), max_inventory - current_inventory)
         allowed_short_capacity = max(Decimal('0'), max_inventory + current_inventory)
 
+    seen_bids = set()
+    seen_asks = set()
+
     # Generate Bids
     for i in range(1, level_count + 1):
         target_price = best_bid - (grid_spacing * i)
@@ -86,10 +89,14 @@ def generate_grid_proposals(
         if target_price <= 0:
             continue
 
+        if target_price in seen_bids:
+            continue
+
         amount = min(rounded_base_size, allowed_long_capacity)
         amount = (amount // step_size) * step_size
 
         if amount > 0:
+            seen_bids.add(target_price)
             proposals.append(OrderProposal("BUY", target_price, amount))
             allowed_long_capacity -= amount
             if allowed_long_capacity <= 0:
@@ -107,28 +114,17 @@ def generate_grid_proposals(
         if target_price <= best_ask:
             target_price = best_ask + tick_size
 
+        if target_price in seen_asks:
+            continue
+
         amount = min(rounded_base_size, allowed_short_capacity)
         amount = (amount // step_size) * step_size
 
         if amount > 0:
+            seen_asks.add(target_price)
             proposals.append(OrderProposal("SELL", target_price, amount))
             allowed_short_capacity -= amount
             if allowed_short_capacity <= 0:
                 break # Reached short capacity
 
-    # Filter duplicate price levels (due to tick size rounding)
-    final_proposals = []
-    seen_bids = set()
-    seen_asks = set()
-
-    for p in proposals:
-        if p.side == "BUY":
-            if p.price not in seen_bids:
-                seen_bids.add(p.price)
-                final_proposals.append(p)
-        else:
-            if p.price not in seen_asks:
-                seen_asks.add(p.price)
-                final_proposals.append(p)
-
-    return final_proposals
+    return proposals

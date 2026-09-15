@@ -286,3 +286,137 @@ def test_zero_negative_quantities():
         market_regime=MarketRegime.NEUTRAL,
         is_stale_data=False
     )) == 0
+
+def test_strong_trend_breakout_shock_regimes():
+    # Long inventory, only sells allowed
+    for regime in [MarketRegime.STRONG_TREND, MarketRegime.BREAKOUT, MarketRegime.SHOCK]:
+        proposals = generate_grid_proposals(
+            best_bid=Decimal('100.0'),
+            best_ask=Decimal('101.0'),
+            current_inventory=Decimal('2.0'),
+            grid_spacing=Decimal('1.0'),
+            base_size=Decimal('1.0'),
+            level_count=3,
+            max_inventory=Decimal('5.0'),
+            tick_size=Decimal('0.1'),
+            step_size=Decimal('0.1'),
+            system_state=SystemState.OPERATIONAL,
+            market_regime=regime,
+            is_stale_data=False
+        )
+        assert len([p for p in proposals if p.side == 'BUY']) == 0
+        assert len([p for p in proposals if p.side == 'SELL']) == 2
+
+    # Flat inventory, no orders allowed
+    for regime in [MarketRegime.STRONG_TREND, MarketRegime.BREAKOUT, MarketRegime.SHOCK]:
+        proposals = generate_grid_proposals(
+            best_bid=Decimal('100.0'),
+            best_ask=Decimal('101.0'),
+            current_inventory=Decimal('0.0'),
+            grid_spacing=Decimal('1.0'),
+            base_size=Decimal('1.0'),
+            level_count=3,
+            max_inventory=Decimal('5.0'),
+            tick_size=Decimal('0.1'),
+            step_size=Decimal('0.1'),
+            system_state=SystemState.OPERATIONAL,
+            market_regime=regime,
+            is_stale_data=False
+        )
+        assert len(proposals) == 0
+
+def test_connection_lost_state():
+    proposals = generate_grid_proposals(
+        best_bid=Decimal('100.0'),
+        best_ask=Decimal('101.0'),
+        current_inventory=Decimal('0.0'),
+        grid_spacing=Decimal('1.0'),
+        base_size=Decimal('1.0'),
+        level_count=3,
+        max_inventory=Decimal('5.0'),
+        tick_size=Decimal('0.1'),
+        step_size=Decimal('0.1'),
+        system_state=SystemState.CONNECTION_LOST,
+        market_regime=MarketRegime.NEUTRAL,
+        is_stale_data=False
+    )
+    assert len(proposals) == 0
+
+def test_duplicate_price_levels_dont_consume_capacity():
+    # Grid spacing is smaller than tick size
+    # Levels will round to the same tick, we must only get 1 proposal per unique price tick
+    proposals = generate_grid_proposals(
+        best_bid=Decimal('100.0'),
+        best_ask=Decimal('101.0'),
+        current_inventory=Decimal('0.0'),
+        grid_spacing=Decimal('0.01'), # Grid spacing smaller than tick size
+        base_size=Decimal('1.0'),
+        level_count=10,
+        max_inventory=Decimal('5.0'),
+        tick_size=Decimal('0.1'),
+        step_size=Decimal('0.1'),
+        system_state=SystemState.OPERATIONAL,
+        market_regime=MarketRegime.NEUTRAL,
+        is_stale_data=False
+    )
+
+    bids = [p for p in proposals if p.side == 'BUY']
+    asks = [p for p in proposals if p.side == 'SELL']
+
+    # Due to tick_size 0.1, multiple grid intervals (0.01) will map to the same tick.
+    # The first bid is 100.0 - 0.01 = 99.99 -> 99.9
+    # The tenth bid is 100.0 - 0.10 = 99.90 -> 99.9
+    # All 10 levels map to 99.9. Thus, only ONE proposal should be generated.
+    assert len(bids) == 1
+    assert bids[0].price == Decimal('99.9')
+    assert bids[0].quantity == Decimal('1.0') # Still 1.0 because duplicates didn't consume capacity
+
+    # Similarly for asks: 101.0 + 0.01 = 101.01 -> 101.1
+    assert len(asks) == 1
+    assert asks[0].price == Decimal('101.1')
+    assert asks[0].quantity == Decimal('1.0')
+
+def test_flat_inventory_reduce_only():
+    proposals = generate_grid_proposals(
+        best_bid=Decimal('100.0'),
+        best_ask=Decimal('101.0'),
+        current_inventory=Decimal('0.0'),
+        grid_spacing=Decimal('1.0'),
+        base_size=Decimal('1.0'),
+        level_count=3,
+        max_inventory=Decimal('5.0'),
+        tick_size=Decimal('0.1'),
+        step_size=Decimal('0.1'),
+        system_state=SystemState.RECONCILING, # Forces reduce-only
+        market_regime=MarketRegime.NEUTRAL,
+        is_stale_data=False
+    )
+    assert len(proposals) == 0
+
+def test_max_inventory_bounds_never_exceeded():
+    proposals = generate_grid_proposals(
+        best_bid=Decimal('100.0'),
+        best_ask=Decimal('101.0'),
+        current_inventory=Decimal('1.2'),
+        grid_spacing=Decimal('1.0'),
+        base_size=Decimal('1.5'),
+        level_count=10,
+        max_inventory=Decimal('5.0'),
+        tick_size=Decimal('0.1'),
+        step_size=Decimal('0.1'),
+        system_state=SystemState.OPERATIONAL,
+        market_regime=MarketRegime.NEUTRAL,
+        is_stale_data=False
+    )
+
+    bids = [p for p in proposals if p.side == 'BUY']
+    total_buy_qty = sum(p.quantity for p in bids)
+    # Long capacity: 5.0 - 1.2 = 3.8
+    assert total_buy_qty <= Decimal('3.8')
+    assert total_buy_qty == Decimal('3.8') # 1.5 + 1.5 + 0.8
+
+    asks = [p for p in proposals if p.side == 'SELL']
+    total_sell_qty = sum(p.quantity for p in asks)
+    # Short capacity: 5.0 + 1.2 = 6.2
+    assert total_sell_qty <= Decimal('6.2')
+    assert total_sell_qty == Decimal('6.2') # 1.5 * 4 = 6.0, + 0.2
