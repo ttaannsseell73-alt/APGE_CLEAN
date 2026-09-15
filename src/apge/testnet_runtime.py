@@ -1,6 +1,8 @@
 import time
 import logging
-from typing import Dict, Any, Optional
+import threading
+import json
+from typing import Dict, Any, Optional, List
 from decimal import Decimal
 
 from apge.binance_adapter import BinanceAdapter
@@ -8,6 +10,92 @@ from apge.grid_strategy import generate_grid_proposals, MarketRegime
 from apge.simulator import SystemState
 
 logger = logging.getLogger(__name__)
+
+class TestnetWebsocketTransport:
+    """
+    Real TESTNET WebSocket runtime handling reconnects and dispatching events.
+    """
+    def __init__(self, ws_url: str, runtime: 'TestnetRuntime', listen_key: str = ""):
+        self.ws_url = ws_url
+        self.runtime = runtime
+        self.listen_key = listen_key
+        self._running = False
+        self._thread = None
+
+        # In a real environment, we'd use websocket-client or websockets.
+        # But to avoid adding dependencies, and since we just need the runtime structure,
+        # we provide the real reconnect loop structure. Tests will mock the actual socket read.
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+    def _run_loop(self):
+        """
+        Main websocket loop handling reconnects safely.
+        """
+        import socket
+        try:
+            import websocket
+            HAS_WS = True
+        except ImportError:
+            HAS_WS = False
+
+        while self._running:
+            if not HAS_WS:
+                logger.warning("websocket-client not installed. Mocking WS connection loop.")
+                time.sleep(1)
+                continue
+
+            try:
+                ws = websocket.WebSocketApp(
+                    self.ws_url,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+                logger.info(f"Connecting to WS: {self.ws_url}")
+                ws.run_forever(ping_interval=60, ping_timeout=10)
+
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+
+            # If we exited run_forever, the socket closed.
+            if self._running:
+                logger.warning("WebSocket closed unexpectedly. Triggering connection loss.")
+                self.runtime.handle_connection_loss()
+                time.sleep(1) # Backoff
+                logger.info("Attempting WebSocket reconnect...")
+
+                # Reconnect successful, we must trigger reconciliation
+                # Wait for the next loop iteration to actually connect,
+                # but we will signal the runtime to reconcile once connected.
+                self.runtime.handle_reconnect()
+
+    def _on_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            if "e" in data:
+                event_type = data["e"]
+                if event_type == "bookTicker":
+                    self.runtime.handle_book_ticker(data)
+                elif event_type in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"):
+                    self.runtime.handle_user_data_event(data, self.runtime.execution_engine)
+        except Exception as e:
+            logger.error(f"Error parsing WS message: {e}")
+
+    def _on_error(self, ws, error):
+        logger.error(f"WS Error: {error}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        logger.info(f"WS Closed: {close_status_code} {close_msg}")
+
 
 class TestnetRuntime:
     """
@@ -29,6 +117,19 @@ class TestnetRuntime:
         self.stale_data_threshold_ms: int = 5000
         self.is_connected: bool = False
 
+        # Dynamic Inventory State
+        self.current_inventory: Decimal = Decimal("0.0")
+
+        self.ws_transports: List[TestnetWebsocketTransport] = []
+        self.execution_engine: Any = None
+        self.reconciler: Any = None
+        self.symbol: str = ""
+
+    def attach_components(self, execution_engine: Any, reconciler: Any, symbol: str):
+        self.execution_engine = execution_engine
+        self.reconciler = reconciler
+        self.symbol = symbol
+
     def sync_server_time(self) -> bool:
         """
         Synchronizes local clock with server time to determine offset.
@@ -43,6 +144,8 @@ class TestnetRuntime:
             latency = (local_time_after - local_time_before) // 2
 
             self.server_time_offset = server_time - (local_time_before + latency)
+            # Propagate offset to adapter so signed requests use it
+            self.adapter.server_time_offset = self.server_time_offset
             logger.info(f"Server time synchronized. Offset: {self.server_time_offset}ms")
             return True
         except Exception as e:
@@ -116,6 +219,58 @@ class TestnetRuntime:
         """
         self.is_connected = False
         logger.warning("Connection lost. Market data is now considered stale.")
+        if self.execution_engine:
+            self.execution_engine.risk_engine.system_state = SystemState.CONNECTION_LOST
+
+    def handle_reconnect(self):
+        """
+        Called when the websocket transport successfully reconnects.
+        Must trigger reconciliation before returning to OPERATIONAL.
+        """
+        logger.info("Websocket reconnected. Triggering reconciliation.")
+        if self.execution_engine and self.reconciler:
+            self.execution_engine.risk_engine.system_state = SystemState.RECONCILING
+            success = self.reconciler.resolve_state(self.symbol)
+            if success:
+                logger.info("Reconciliation complete. Returning to OPERATIONAL.")
+                # Also refresh inventory
+                self.sync_inventory()
+                self.execution_engine.risk_engine.system_state = SystemState.OPERATIONAL
+            else:
+                logger.error("Reconciliation failed upon reconnect. HALTING.")
+                self.execution_engine.risk_engine.system_state = SystemState.HALTED
+
+    def sync_inventory(self):
+        """
+        Syncs inventory from REST API.
+        """
+        try:
+            positions = self.adapter.get_positions()
+            pos = next((p for p in positions if p.get("symbol") == self.symbol), None)
+            if pos:
+                self.current_inventory = Decimal(str(pos.get("positionAmt", "0.0")))
+                logger.info(f"Inventory synced to {self.current_inventory}")
+        except Exception as e:
+            logger.error(f"Failed to sync inventory: {e}")
+
+    def start_event_loops(self, listen_key: str):
+        """
+        Starts the underlying websocket transports for Market Data and User Data.
+        """
+        ws_domain = self.adapter.ws_url
+
+        # 1. Market Data Stream
+        market_stream = f"{ws_domain}/ws/{self.symbol.lower()}@bookTicker"
+        market_ws = TestnetWebsocketTransport(market_stream, self)
+        self.ws_transports.append(market_ws)
+
+        # 2. User Data Stream
+        user_stream = f"{ws_domain}/ws/{listen_key}"
+        user_ws = TestnetWebsocketTransport(user_stream, self, listen_key)
+        self.ws_transports.append(user_ws)
+
+        for ws in self.ws_transports:
+            ws.start()
 
     def handle_user_data_event(self, event: Dict[str, Any], execution_engine: Any):
         """
@@ -125,20 +280,23 @@ class TestnetRuntime:
 
         if event_type == "ACCOUNT_UPDATE":
             parsed = self.adapter.parse_account_update(event)
-            # Typically, we update our local inventory/balance cache here.
-            # We don't rely solely on this for reconciliation, but it keeps things fresh.
-            # In V1, inventory is typically reconciled by get_positions(), but updates are fine.
-            logger.info(f"Account update: {parsed['reason']}")
+            # Update real inventory cache dynamically
+            for pos in parsed.get("positions", []):
+                if pos["symbol"] == self.symbol:
+                    self.current_inventory = Decimal(str(pos["position_amount"]))
+                    logger.info(f"Account update: Inventory is now {self.current_inventory}")
 
         elif event_type == "ORDER_TRADE_UPDATE":
             parsed = self.adapter.parse_order_trade_update(event)
             # Pass to execution engine to handle fill/cancel idempotency safely
             execution_engine.handle_order_update(parsed)
+            # Note: We rely on ACCOUNT_UPDATE to modify current_inventory for complete correctness,
+            # as Binance sends ACCOUNT_UPDATE simultaneously with ORDER_TRADE_UPDATE.
 
         else:
             logger.debug(f"Unhandled user data event type: {event_type}")
 
-    def run_grid_cycle(self, symbol: str, current_inventory: Decimal,
+    def run_grid_cycle(self,
                        grid_spacing: Decimal, base_size: Decimal, level_count: int,
                        max_inventory: Decimal, system_state: SystemState,
                        market_regime: MarketRegime, execution_engine: Any):
@@ -150,25 +308,46 @@ class TestnetRuntime:
         bb = self.best_bid or Decimal("0")
         ba = self.best_ask or Decimal("0")
 
+        # 0. Enforce symbol filters
+        if not self.tick_size or not self.step_size or "minQty" not in self.filters or "minNotional" not in self.filters:
+            logger.warning("Cannot run grid cycle: missing required exchange filters. Failing closed.")
+            return
+
         # 1. Generate desired grid
         proposals = generate_grid_proposals(
             best_bid=bb,
             best_ask=ba,
-            current_inventory=current_inventory,
+            current_inventory=self.current_inventory, # Dynamic state
             grid_spacing=grid_spacing,
             base_size=base_size,
             level_count=level_count,
             max_inventory=max_inventory,
-            tick_size=self.tick_size or Decimal("0.1"),
-            step_size=self.step_size or Decimal("0.001"),
+            tick_size=self.tick_size,
+            step_size=self.step_size,
             system_state=system_state,
             market_regime=market_regime,
             is_stale_data=self.is_stale_data()
         )
 
+        # Enforce notional and qty limits natively before diffing
+        valid_proposals = []
+        for p in proposals:
+            if p.quantity < self.filters["minQty"]:
+                logger.debug(f"Proposal {p.side} rejected: {p.quantity} < minQty {self.filters['minQty']}")
+                continue
+            if "maxQty" in self.filters and p.quantity > self.filters["maxQty"]:
+                logger.debug(f"Proposal {p.side} rejected: {p.quantity} > maxQty {self.filters['maxQty']}")
+                continue
+            if p.price * p.quantity < self.filters["minNotional"]:
+                logger.debug(f"Proposal {p.side} rejected: notional {p.price * p.quantity} < minNotional {self.filters['minNotional']}")
+                continue
+            valid_proposals.append(p)
+
+        proposals = valid_proposals
+
         # 2. Get currently tracked active orders from persistence
         active_intents = execution_engine.persistence.get_active_intents()
-        active_orders = [i for i in active_intents if i["symbol"] == symbol]
+        active_orders = [i for i in active_intents if i["symbol"] == self.symbol]
 
         # 3. Diffing: minimal submit/cancel changes
         desired_set = set()
@@ -178,16 +357,6 @@ class TestnetRuntime:
         current_set = set()
         order_map = {}
         for intent in active_orders:
-            key = (intent["side"], Decimal(intent["price"]), Decimal(intent["quantity"]) - Decimal(intent["filled_quantity"]))
-            # If an order is partially filled, we treat the remaining amount as the active key.
-            # But grid proposals don't know about partial fills natively.
-            # A simple approach for V1: if it's partially filled, we might cancel and recreate,
-            # or just leave it. Let's just track the original quantity for exact matching to avoid churn.
-            # Grid strategy requests specific amounts. If partial fill happened, it reduces inventory,
-            # which shifts the grid up/down, naturally handling the counter order.
-            # So matching exactly on original price and remaining quantity is safest to avoid churn.
-
-            # Actually, to prevent churn on untouched orders, match on original price and original quantity
             key_exact = (intent["side"], Decimal(intent["price"]), Decimal(intent["quantity"]))
             current_set.add(key_exact)
             if key_exact not in order_map:
@@ -201,13 +370,10 @@ class TestnetRuntime:
         for key in to_cancel_keys:
             cids = order_map[key]
             for cid in cids:
-                execution_engine.cancel_order(symbol, cid)
+                execution_engine.cancel_order(self.symbol, cid)
 
         # 5. Execute Creations
         for side, price, qty in to_create:
-            # We reconstruct the proposal object
-            # Note: For multiple identical proposals, Python sets dedup them.
-            # generate_grid_proposals doesn't generate identical proposals.
             proposal = next((p for p in proposals if p.side == side and p.price == price and p.quantity == qty), None)
             if proposal:
-                execution_engine.execute_proposal(symbol, proposal)
+                execution_engine.execute_proposal(self.symbol, proposal)

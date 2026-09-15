@@ -93,10 +93,40 @@ def test_cancel_fill_race_condition(engine_setup):
         "trade_id": "trade1",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
-        "mapped_state": OrderState.FILLED
+        "mapped_state": OrderState.FILLED, "order_status": "FILLED"
     })
 
     # It must be updated to FILLED
     intent = db.get_intent(cid)
     assert intent["status"] == "FILLED"
     assert Decimal(intent["filled_quantity"]) == Decimal("1.0")
+
+def test_unknown_blocks_risk_increasing_orders(engine_setup):
+    engine, db = engine_setup
+
+    # 1. Trigger an UNKNOWN state
+    proposal1 = OrderProposal("BUY", Decimal("100.0"), Decimal("1.0"))
+    cid1 = engine.execute_proposal("BTCUSDT", proposal1)
+    assert cid1 is not None
+    assert engine.risk_engine.system_state == SystemState.RECONCILING
+
+    # 2. Try to submit a second risk-increasing order
+    proposal2 = OrderProposal("BUY", Decimal("99.0"), Decimal("1.0"))
+    cid2 = engine.execute_proposal("BTCUSDT", proposal2)
+
+    # Since UNKNOWN orders exist, the RiskEngine gate must reject it outright.
+    assert cid2 is None
+
+def test_deterministic_client_order_id(engine_setup):
+    engine, db = engine_setup
+
+    # 1. Ask for a CID for a specific intent
+    engine.risk_engine._get_time_override = 1000.0 # Force time to be static for identical requests
+    def mock_get_time(): return engine.risk_engine._get_time_override
+    engine.risk_engine.get_time = mock_get_time
+
+    cid1 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
+    cid2 = engine._generate_client_order_id("BTCUSDT", "BUY", Decimal("1.0"), Decimal("100.0"))
+
+    assert cid1 == cid2
+    assert cid1.startswith("APGE_")

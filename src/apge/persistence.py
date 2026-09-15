@@ -37,6 +37,7 @@ class Persistence:
                     quantity TEXT NOT NULL,
                     price TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    raw_exchange_status TEXT,
                     exchange_order_id TEXT,
                     filled_quantity TEXT DEFAULT '0',
                     average_price TEXT DEFAULT '0',
@@ -64,17 +65,27 @@ class Persistence:
     def save_intent(self, client_order_id: str, symbol: str, side: str, quantity: Decimal, price: Decimal, status: OrderState):
         with self.conn:
             self.conn.execute("""
-                INSERT INTO intents (client_order_id, symbol, side, quantity, price, status)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (client_order_id, symbol, side, str(quantity), str(price), status.name))
+                INSERT INTO intents (client_order_id, symbol, side, quantity, price, status, raw_exchange_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (client_order_id, symbol, side, str(quantity), str(price), status.name, "NEW"))
 
-    def update_intent_status(self, client_order_id: str, status: OrderState, exchange_order_id: Optional[str] = None):
+    def update_intent_status(self, client_order_id: str, status: OrderState, exchange_order_id: Optional[str] = None, raw_status: Optional[str] = None):
         with self.conn:
-            if exchange_order_id:
+            if exchange_order_id and raw_status:
+                self.conn.execute("""
+                    UPDATE intents SET status = ?, exchange_order_id = ?, raw_exchange_status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (status.name, exchange_order_id, raw_status, client_order_id))
+            elif exchange_order_id:
                 self.conn.execute("""
                     UPDATE intents SET status = ?, exchange_order_id = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE client_order_id = ?
                 """, (status.name, exchange_order_id, client_order_id))
+            elif raw_status:
+                self.conn.execute("""
+                    UPDATE intents SET status = ?, raw_exchange_status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (status.name, raw_status, client_order_id))
             else:
                 self.conn.execute("""
                     UPDATE intents SET status = ?, updated_at = CURRENT_TIMESTAMP

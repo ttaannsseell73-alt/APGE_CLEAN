@@ -2,6 +2,7 @@ import uuid
 from typing import Dict, Any, List, Optional
 from decimal import Decimal
 import logging
+import hashlib
 
 from apge.persistence import Persistence
 from apge.binance_adapter import BinanceAdapter
@@ -20,9 +21,12 @@ class ExecutionEngine:
         self.adapter = adapter
         self.risk_engine = risk_engine
 
-    def _generate_client_order_id(self) -> str:
-        # APGE prefix for easy identification, plus a UUID
-        return f"APGE_{uuid.uuid4().hex[:20]}"
+    def _generate_client_order_id(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> str:
+        # Make deterministic based on intent, so retrying the exact same intent yields the same CID.
+        # This prevents duplicate orders on retry.
+        unique_string = f"{symbol}_{side}_{quantity}_{price}_{self.risk_engine.get_time()}"
+        hashed = hashlib.sha256(unique_string.encode('utf-8')).hexdigest()[:20]
+        return f"APGE_{hashed}"
 
     def execute_proposal(self, symbol: str, proposal: OrderProposal) -> Optional[str]:
         """
@@ -33,14 +37,18 @@ class ExecutionEngine:
             logger.warning("Attempted to execute proposal while not OPERATIONAL.")
             return None
 
-        # The risk engine has `evaluate_proposal`. We should get an approval first.
-        # BUT the Simulator RiskEngine in this branch accepts parameters `(symbol, side, quantity, price, intent)`.
-        # We will assume risk was already checked or we bypass for now as strategy constrained it,
-        # but to satisfy "Risk Engine is always the highest authority", we should call it.
-        # For this execution layer, we assume if it reached here, the proposal is vetted by the runtime layer
-        # which acts as the orchestrator. Or we can just perform the submit.
+        # 1. Ask Risk Engine for approval (MUST NOT BE BYPASSED)
+        approval = self.risk_engine.request_approval(amount=proposal.quantity, symbol=symbol, side=proposal.side)
+        if not approval:
+            logger.warning(f"RiskEngine rejected proposal: {symbol} {proposal.side} {proposal.quantity}")
+            return None
 
-        cid = self._generate_client_order_id()
+        cid = self._generate_client_order_id(symbol, proposal.side, proposal.quantity, proposal.price)
+
+        # 2. Consume approval atomically with order creation in risk engine
+        if not self.risk_engine.consume_approval_and_submit(approval, cid, symbol=symbol, side=proposal.side):
+            logger.warning(f"RiskEngine failed to consume approval for {cid}")
+            return None
 
         # Save intent BEFORE network call
         self.persistence.save_intent(
@@ -49,7 +57,7 @@ class ExecutionEngine:
             side=proposal.side,
             quantity=proposal.quantity,
             price=proposal.price,
-            status=OrderState.OPEN # Mark as OPEN or PENDING. We use OPEN as per Simulator enum.
+            status=OrderState.OPEN
         )
 
         # Submit to exchange
@@ -61,18 +69,23 @@ class ExecutionEngine:
             client_order_id=cid
         )
 
+        raw_status = response.get("status", "UNKNOWN")
+
         # Adapter returns UNKNOWN on timeout
-        if response.get("status") == "UNKNOWN":
+        if raw_status == "UNKNOWN":
             logger.warning(f"Submit timeout for {cid}, setting to UNKNOWN")
-            self.persistence.update_intent_status(cid, OrderState.UNKNOWN)
-            # If UNKNOWN, we should transition system state to RECONCILING in the runtime layer.
+            self.persistence.update_intent_status(cid, OrderState.UNKNOWN, raw_status=raw_status)
+            # If UNKNOWN, we MUST transition system state to RECONCILING to stop risk-increasing activity
+            self.risk_engine.system_state = SystemState.RECONCILING
             # We return the cid so the caller knows it was attempted.
             return cid
 
         # Parse success
         if "orderId" in response:
-            mapped_state = self.adapter._map_order_state(response["status"])
-            self.persistence.update_intent_status(cid, mapped_state, str(response["orderId"]))
+            mapped_state = self.adapter._map_order_state(raw_status)
+            self.persistence.update_intent_status(cid, mapped_state, str(response["orderId"]), raw_status=raw_status)
+            # Provide feedback to RiskEngine about the actual state to clear the UNKNOWN gate
+            self.risk_engine.resolve_order(cid, mapped_state, Decimal("0.0"))
             return cid
 
         # It was rejected by the exchange
@@ -81,7 +94,7 @@ class ExecutionEngine:
         # But Simulator OrderState does not have REJECTED.
         # The prompt says: "Preserve order-state semantics strictly: never map REJECTED to CANCELED. Map to UNKNOWN or preserve raw status if the target enum lacks a specific REJECTED state."
         # So we map to UNKNOWN since OrderState doesn't have REJECTED.
-        self.persistence.update_intent_status(cid, OrderState.UNKNOWN)
+        self.persistence.update_intent_status(cid, OrderState.UNKNOWN, raw_status=raw_status)
         return None
 
     def cancel_order(self, symbol: str, client_order_id: str) -> bool:
@@ -96,10 +109,11 @@ class ExecutionEngine:
             return False
 
         response = self.adapter.cancel_order(symbol, client_order_id)
+        raw_status = response.get("status", "UNKNOWN")
 
         if "orderId" in response:
-            mapped_state = self.adapter._map_order_state(response["status"])
-            self.persistence.update_intent_status(client_order_id, mapped_state, str(response["orderId"]))
+            mapped_state = self.adapter._map_order_state(raw_status)
+            self.persistence.update_intent_status(client_order_id, mapped_state, str(response["orderId"]), raw_status=raw_status)
             return True
 
         return False
@@ -118,6 +132,7 @@ class ExecutionEngine:
             return
 
         mapped_state = update["mapped_state"]
+        raw_status = update["order_status"]
 
         # If it's a fill, apply it safely
         if update["execution_type"] == "TRADE":
@@ -149,7 +164,7 @@ class ExecutionEngine:
         elif current_status == "CANCELED" and mapped_state == OrderState.FILLED:
             # Race condition: We thought it was canceled, but it actually filled.
             # Update to FILLED to reflect reality.
-            self.persistence.update_intent_status(cid, mapped_state, intent.get("exchange_order_id"))
+            self.persistence.update_intent_status(cid, mapped_state, intent.get("exchange_order_id"), raw_status=raw_status)
         else:
             # Normal update
-            self.persistence.update_intent_status(cid, mapped_state, intent.get("exchange_order_id"))
+            self.persistence.update_intent_status(cid, mapped_state, intent.get("exchange_order_id"), raw_status=raw_status)

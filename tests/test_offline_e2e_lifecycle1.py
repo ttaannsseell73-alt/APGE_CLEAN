@@ -60,7 +60,7 @@ def test_partial_and_full_fills(engine_setup):
         "trade_id": "trade1",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
-        "mapped_state": OrderState.PARTIALLY_FILLED
+        "mapped_state": OrderState.PARTIALLY_FILLED, "order_status": "PARTIALLY_FILLED"
     })
 
     intent = db.get_intent(cid)
@@ -74,7 +74,7 @@ def test_partial_and_full_fills(engine_setup):
         "trade_id": "trade1", # Same trade ID
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
-        "mapped_state": OrderState.PARTIALLY_FILLED
+        "mapped_state": OrderState.PARTIALLY_FILLED, "order_status": "PARTIALLY_FILLED"
     })
 
     intent = db.get_intent(cid)
@@ -88,7 +88,7 @@ def test_partial_and_full_fills(engine_setup):
         "trade_id": "trade2",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
-        "mapped_state": OrderState.FILLED
+        "mapped_state": OrderState.FILLED, "order_status": "FILLED"
     })
 
     intent = db.get_intent(cid)
