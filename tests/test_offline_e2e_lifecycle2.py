@@ -1,0 +1,102 @@
+import pytest
+from decimal import Decimal
+
+from apge.persistence import Persistence
+from apge.simulator import OrderState, RiskEngine, SystemState
+from apge.execution_engine import ExecutionEngine
+from apge.grid_strategy import OrderProposal
+
+class MockTimeoutAdapter:
+    def submit_limit_order(self, **kwargs):
+        # Simulate network timeout returning UNKNOWN
+        return {"status": "UNKNOWN", "clientOrderId": kwargs["client_order_id"]}
+
+    def _map_order_state(self, status):
+        mapping = {"FILLED": OrderState.FILLED, "CANCELED": OrderState.CANCELED}
+        return mapping.get(status, OrderState.UNKNOWN)
+
+@pytest.fixture
+def engine_setup():
+    db = Persistence()
+    risk_engine = RiskEngine(position_limit=Decimal("5.0"))
+    risk_engine.system_state = SystemState.OPERATIONAL
+    adapter = MockTimeoutAdapter()
+    engine = ExecutionEngine(db, adapter, risk_engine)
+    yield engine, db
+    db.close()
+
+def test_unknown_submission_reconcile_query(engine_setup):
+    engine, db = engine_setup
+    proposal = OrderProposal("BUY", Decimal("100.0"), Decimal("1.0"))
+    cid = engine.execute_proposal("BTCUSDT", proposal)
+
+    # 1. State must be UNKNOWN
+    intent = db.get_intent(cid)
+    assert intent["status"] == "UNKNOWN"
+
+    # 2. Later, a reconciliation query finds it
+    from apge.reconciliation import Reconciler
+
+    # We patch adapter for the reconciler to return successfully on query
+    class QueryAdapter(MockTimeoutAdapter):
+        def query_order(self, symbol, orig_cid):
+            if orig_cid == cid:
+                return {"status": "FILLED", "orderId": "resolved123", "executedQty": "1.0", "avgPrice": "100.0"}
+            raise Exception("Order does not exist")
+        def get_positions(self): return []
+        def get_open_orders(self, symbol=None): return []
+
+    reconciler = Reconciler(db, QueryAdapter())
+    success = reconciler.resolve_state("BTCUSDT")
+    assert success == True
+
+    # Intent should be updated
+    updated_intent = db.get_intent(cid)
+    assert updated_intent["status"] == "FILLED"
+    assert Decimal(updated_intent["filled_quantity"]) == Decimal("1.0")
+
+def test_unknown_submission_query_absent(engine_setup):
+    engine, db = engine_setup
+    proposal = OrderProposal("BUY", Decimal("100.0"), Decimal("1.0"))
+    cid = engine.execute_proposal("BTCUSDT", proposal)
+
+    from apge.reconciliation import Reconciler
+
+    # Patch adapter for reconciler: returns -2013 (Order does not exist)
+    class MissingQueryAdapter(MockTimeoutAdapter):
+        def query_order(self, symbol, orig_cid):
+            raise Exception("Order does not exist -2013")
+        def get_positions(self): return []
+        def get_open_orders(self, symbol=None): return []
+
+    reconciler = Reconciler(db, MissingQueryAdapter())
+    success = reconciler.resolve_state("BTCUSDT")
+    assert success == True
+
+    # Since it never existed, safe to mark as CANCELED
+    updated_intent = db.get_intent(cid)
+    assert updated_intent["status"] == "CANCELED"
+
+def test_cancel_fill_race_condition(engine_setup):
+    # Tests that if we mark something as canceled locally, but it filled on exchange,
+    # the websocket trade update properly overrides the canceled state.
+    engine, db = engine_setup
+
+    # Manually setup a locally canceled order
+    cid = "race1"
+    db.save_intent(cid, "BTCUSDT", "BUY", Decimal("1.0"), Decimal("100"), OrderState.CANCELED)
+
+    # WS update arrives saying it's filled
+    engine.handle_order_update({
+        "client_order_id": cid,
+        "execution_type": "TRADE",
+        "trade_id": "trade1",
+        "last_filled_qty": Decimal("1.0"),
+        "last_filled_price": Decimal("100.0"),
+        "mapped_state": OrderState.FILLED
+    })
+
+    # It must be updated to FILLED
+    intent = db.get_intent(cid)
+    assert intent["status"] == "FILLED"
+    assert Decimal(intent["filled_quantity"]) == Decimal("1.0")
