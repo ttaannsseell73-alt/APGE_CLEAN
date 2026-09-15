@@ -188,7 +188,7 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
     runtime.run_grid_cycle(
         grid_spacing=Decimal("1.0"),
         base_size=Decimal("5.0"), # Max size per level
-        level_count=1,
+        level_count=2, # Will attempt 2 levels (10.0 total capacity needed)
         max_inventory=Decimal("5.0"),
         system_state=SystemState.OPERATIONAL,
         market_regime=MarketRegime.NEUTRAL,
@@ -196,21 +196,46 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
     )
 
     intents1 = db.get_active_intents()
-    assert len(intents1) == 2 # 1 BUY, 1 SELL
+    # At inventory 0.0, capacity is 5.0. Only 1 level of 5.0 fits.
+    assert len(intents1) == 2 # 1 BUY (5.0 @ 99), 1 SELL (5.0 @ 102)
 
     for intent in intents1:
         execution_engine.risk_engine.resolve_order(intent["client_order_id"], OrderState.OPEN, Decimal("0.0"))
 
-    # 2. Simulate a BUY fill increasing inventory to 5.0 (max long)
-    runtime.current_inventory = Decimal("5.0")
+    # 2. Simulate an actual BUY fill
+    buy_intent = next(i for i in intents1 if i["side"] == "BUY")
+    cid = buy_intent["client_order_id"]
 
-    # Run cycle again.
-    # We are max long, so no new BUYs should be proposed. The old BUY should be canceled.
-    # SELL capacity increases to 5.0 + 5.0 = 10.0. The strategy proposes SELL up to allowed capacity.
+    # Deliver the fill natively
+    execution_engine.handle_order_update({
+        "client_order_id": cid,
+        "execution_type": "TRADE",
+        "trade_id": "trade_buy_1",
+        "last_filled_qty": Decimal("5.0"),
+        "last_filled_price": Decimal("99.0"),
+        "mapped_state": OrderState.FILLED,
+        "order_status": "FILLED"
+    })
+
+    # Prove fill applied exactly once
+    updated_buy_intent = db.get_intent(cid)
+    assert updated_buy_intent["status"] == "FILLED"
+    assert Decimal(updated_buy_intent["filled_quantity"]) == Decimal("5.0")
+    fills = db.conn.execute("SELECT * FROM fills WHERE client_order_id = ?", (cid,)).fetchall()
+    assert len(fills) == 1
+
+    # Simulate corresponding ACCOUNT_UPDATE
+    runtime.adapter.parse_account_update = lambda e: {"positions": [{"symbol": "BTCUSDT", "position_amount": Decimal("5.0")}]}
+    runtime.handle_user_data_event({"e": "ACCOUNT_UPDATE"}, execution_engine)
+
+    # Prove inventory changed due to event
+    assert runtime.current_inventory == Decimal("5.0")
+
+    # 3. Next grid cycle
     runtime.run_grid_cycle(
         grid_spacing=Decimal("1.0"),
         base_size=Decimal("5.0"),
-        level_count=1,
+        level_count=2,
         max_inventory=Decimal("5.0"),
         system_state=SystemState.OPERATIONAL,
         market_regime=MarketRegime.NEUTRAL,
@@ -218,20 +243,18 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
     )
 
     intents2 = db.get_active_intents()
-
-    # Check that inventory was updated
-    assert runtime.current_inventory == Decimal("5.0")
-
     buys = [i for i in intents2 if i["side"] == "BUY"]
     sells = [i for i in intents2 if i["side"] == "SELL"]
 
-    # No BUY orders because we are at max long inventory
+    # No buys due to max long
     assert len(buys) == 0
 
-    # There should be SELL orders representing the counter exposure
-    assert len(sells) > 0
-    total_sell_qty = sum(Decimal(s["quantity"]) for s in sells)
+    # Old sell was 1 level at 102.0.
+    # Now short capacity is 5.0 (max) + 5.0 (inv) = 10.0.
+    # Level count is 2. Both levels should spawn! (5.0 @ 102, 5.0 @ 103)
+    assert len(sells) == 2
+    prices = {Decimal(s["price"]) for s in sells}
+    assert prices == {Decimal("102.0"), Decimal("103.0")}
 
-    # Old sell quantity was 5.0. It should now have the ability to sell 5.0 (which it does because base_size is 5.0 and level_count is 1)
-    assert total_sell_qty == Decimal("5.0")
-    assert Decimal(sells[0]["price"]) == Decimal("102.0")
+    # The 103.0 order is definitively a newly proposed counter-exposure created because inventory increased
+    # The assertion proves it cannot pass merely because the original pre-fill SELL order still exists.
