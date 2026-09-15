@@ -31,10 +31,11 @@ class MockTransport:
         return self.responses.pop(0) if self.responses else {}
 
 
-def test_rejects_production_urls():
+def test_rejects_invalid_urls():
     transport = MockTransport()
 
-    with pytest.raises(ValueError, match="Production URLs are strictly forbidden"):
+    # Production HTTP
+    with pytest.raises(ValueError, match="TESTNET ONLY"):
         BinanceAdapter(
             transport,
             http_url="https://fapi.binance.com",
@@ -43,7 +44,8 @@ def test_rejects_production_urls():
             api_secret="test"
         )
 
-    with pytest.raises(ValueError, match="Production URLs are strictly forbidden"):
+    # Production WS
+    with pytest.raises(ValueError, match="TESTNET ONLY"):
         BinanceAdapter(
             transport,
             http_url="https://testnet.binancefuture.com",
@@ -52,26 +54,70 @@ def test_rejects_production_urls():
             api_secret="test"
         )
 
+    # Arbitrary host HTTP
+    with pytest.raises(ValueError, match="TESTNET ONLY"):
+        BinanceAdapter(
+            transport,
+            http_url="https://example.com",
+            ws_url="wss://stream.binancefuture.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Spoofing / Lookalike HTTP
+    with pytest.raises(ValueError, match="TESTNET ONLY"):
+        BinanceAdapter(
+            transport,
+            http_url="https://testnet.binancefuture.com.malicious.com",
+            ws_url="wss://stream.binancefuture.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Spoofing / Lookalike WS
+    with pytest.raises(ValueError, match="TESTNET ONLY"):
+        BinanceAdapter(
+            transport,
+            http_url="https://testnet.binancefuture.com",
+            ws_url="wss://stream.binancefuture.com.malicious.com",
+            api_key="test",
+            api_secret="test"
+        )
+
+    # Valid TESTNET
+    adapter = BinanceAdapter(
+        transport,
+        http_url="https://testnet.binancefuture.com",
+        ws_url="wss://stream.binancefuture.com",
+        api_key="test",
+        api_secret="test"
+    )
+    assert adapter.http_url == "https://testnet.binancefuture.com"
+
 def test_deterministic_signature():
     transport = MockTransport()
+    # Mock clock returns exactly 1600000000.0 (seconds) -> 1600000000000 ms
     adapter = BinanceAdapter(
         transport,
         http_url="https://testnet.binancefuture.com",
         ws_url="wss://stream.binancefuture.com",
         api_key="test_key",
-        api_secret="test_secret"
+        api_secret="test_secret",
+        clock=lambda: 1600000000.0
     )
 
     params = {
         "symbol": "BTCUSDT",
-        "side": "BUY",
-        "timestamp": 1600000000000
+        "side": "BUY"
     }
 
     signed = adapter._prepare_signed_params(params)
     assert "signature" in signed
     assert str(signed["timestamp"]) == "1600000000000"
     assert len(signed["signature"]) == 64
+
+    # Ensure original params were not mutated
+    assert "timestamp" not in params
 
 def _setup_adapter(transport: MockTransport) -> BinanceAdapter:
     return BinanceAdapter(
@@ -169,6 +215,16 @@ def test_submit_order_timeout_returns_unknown():
     assert res["clientOrderId"] == "client_id"
     assert res["status"] == "UNKNOWN"
 
+def test_submit_order_exception_propagation():
+    class BrokenTransport(MockTransport):
+        def post(self, url: str, data: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+            raise ValueError("Definite programming error or validation error")
+
+    adapter = _setup_adapter(BrokenTransport())
+
+    with pytest.raises(ValueError, match="Definite programming error or validation error"):
+        adapter.submit_limit_order("BTCUSDT", "BUY", Decimal("1.5"), Decimal("50000.0"), "client_id")
+
 def test_cancel_order():
     transport = MockTransport()
     adapter = _setup_adapter(transport)
@@ -202,7 +258,7 @@ def test_parse_book_ticker():
 
 def test_parse_order_trade_update():
     adapter = _setup_adapter(MockTransport())
-    payload = {
+    base_payload = {
         "e": "ORDER_TRADE_UPDATE",
         "T": 1568879465651,
         "E": 1568879465658,
@@ -241,7 +297,7 @@ def test_parse_order_trade_update():
         }
     }
 
-    parsed = adapter.parse_order_trade_update(payload)
+    parsed = adapter.parse_order_trade_update(base_payload)
     assert parsed["symbol"] == "BTCUSDT"
     assert parsed["client_order_id"] == "TEST"
     assert parsed["side"] == "SELL"
@@ -253,6 +309,25 @@ def test_parse_order_trade_update():
     assert parsed["accumulated_filled_qty"] == Decimal("0.001")
     assert parsed["last_filled_price"] == Decimal("9900")
     assert parsed["trade_id"] == "29653"
+
+def test_parse_order_trade_update_states():
+    adapter = _setup_adapter(MockTransport())
+    def make_payload(status: str):
+        return {
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {
+                "s": "BTCUSDT", "c": "TEST", "S": "SELL", "o": "LIMIT", "f": "GTC",
+                "q": "0.001", "p": "9900", "ap": "0", "x": "NEW", "X": status,
+                "l": "0", "z": "0", "L": "0"
+            }
+        }
+
+    assert adapter.parse_order_trade_update(make_payload("NEW"))["mapped_state"] == OrderState.OPEN
+    assert adapter.parse_order_trade_update(make_payload("PARTIALLY_FILLED"))["mapped_state"] == OrderState.PARTIALLY_FILLED
+    assert adapter.parse_order_trade_update(make_payload("FILLED"))["mapped_state"] == OrderState.FILLED
+    assert adapter.parse_order_trade_update(make_payload("CANCELED"))["mapped_state"] == OrderState.CANCELED
+    assert adapter.parse_order_trade_update(make_payload("REJECTED"))["mapped_state"] == OrderState.UNKNOWN
+    assert adapter.parse_order_trade_update(make_payload("EXPIRED"))["mapped_state"] == OrderState.UNKNOWN
 
 def test_parse_account_update():
     adapter = _setup_adapter(MockTransport())

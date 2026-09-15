@@ -24,15 +24,21 @@ class Transport(Protocol):
 class BinanceAdapter:
     """Binance USD-M Futures TESTNET exchange adapter."""
 
-    def __init__(self, transport: Transport, http_url: str, ws_url: str, api_key: str, api_secret: str):
-        if "fapi.binance.com" in http_url or "fapi.binance.com" in ws_url:
-            raise ValueError("Production URLs are strictly forbidden. TESTNET ONLY.")
+    def __init__(self, transport: Transport, http_url: str, ws_url: str, api_key: str, api_secret: str, clock=None):
+        http_hostname = urllib.parse.urlparse(http_url).hostname
+        ws_hostname = urllib.parse.urlparse(ws_url).hostname
+
+        if http_hostname != "testnet.binancefuture.com":
+            raise ValueError(f"Invalid HTTP URL: {http_url}. TESTNET ONLY.")
+        if ws_hostname != "stream.binancefuture.com":
+            raise ValueError(f"Invalid WS URL: {ws_url}. TESTNET ONLY.")
 
         self.transport = transport
         self.http_url = http_url.rstrip("/")
         self.ws_url = ws_url.rstrip("/")
         self.api_key = api_key
         self.api_secret = api_secret
+        self.clock = clock or time.time
 
     def _generate_signature(self, query_string: str) -> str:
         """Generate deterministic HMAC SHA256 signature."""
@@ -49,12 +55,15 @@ class BinanceAdapter:
 
     def _prepare_signed_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Prepare signed parameters with deterministic ordering."""
+        # Work on a copy to avoid mutating the caller's dictionary
+        params_copy = dict(params)
+
         # Ensure timestamp is present
-        if "timestamp" not in params:
-            params["timestamp"] = int(time.time() * 1000)
+        if "timestamp" not in params_copy:
+            params_copy["timestamp"] = int(self.clock() * 1000)
 
         # Filter out None values and create a sorted query string
-        query_params = [(k, str(v)) for k, v in sorted(params.items()) if v is not None]
+        query_params = [(k, str(v)) for k, v in sorted(params_copy.items()) if v is not None]
         query_string = urllib.parse.urlencode(query_params, safe="")
 
         signature = self._generate_signature(query_string)
@@ -117,7 +126,7 @@ class BinanceAdapter:
 
         try:
             return self.transport.post(url, data=params, headers=self._get_headers())
-        except Exception:
+        except (TimeoutError, ConnectionError):
             # Model submit timeout as UNKNOWN, never assume success or failure.
             # No blind retry of order placement.
             return {
@@ -142,8 +151,6 @@ class BinanceAdapter:
             "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
             "FILLED": OrderState.FILLED,
             "CANCELED": OrderState.CANCELED,
-            "REJECTED": OrderState.CANCELED, # Rejections cancel the order
-            "EXPIRED": OrderState.CANCELED,
         }
         return mapping.get(status, OrderState.UNKNOWN)
 
