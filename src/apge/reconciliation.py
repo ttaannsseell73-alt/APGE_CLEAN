@@ -5,143 +5,176 @@ from apge.persistence import Persistence
 from apge.binance_adapter import BinanceAdapter
 from apge.simulator import OrderState, RiskEngine
 
+
 class Reconciler:
-    def __init__(self, persistence: Persistence, adapter: BinanceAdapter, risk_engine: Optional[RiskEngine] = None):
+    def __init__(self, persistence: Persistence, adapter: BinanceAdapter,
+                 risk_engine: Optional[RiskEngine] = None):
         self.persistence = persistence
         self.adapter = adapter
         self.risk_engine = risk_engine
         self.last_position_amount = Decimal("0")
 
     def fetch_exchange_state(self, symbol: str) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """
-        Fetches current position and open orders for the symbol from the exchange.
-        Raises exception on network failure.
-        """
         positions_response = self.adapter.get_positions()
-        # Find the specific position
         position = next((p for p in positions_response if p.get("symbol") == symbol), None)
         if position is None:
-            # Construct a default zero position
-            position = {
-                "symbol": symbol,
-                "positionAmt": "0.0",
-                "entryPrice": "0.0"
-            }
+            position = {"symbol": symbol, "positionAmt": "0.0", "entryPrice": "0.0"}
+        return position, self.adapter.get_open_orders(symbol=symbol)
 
-        open_orders_response = self.adapter.get_open_orders(symbol=symbol)
+    @staticmethod
+    def _finite_decimal(value: Any) -> Optional[Decimal]:
+        try:
+            result = Decimal(str(value))
+        except Exception:
+            return None
+        if result.is_nan() or result.is_infinite():
+            return None
+        return result
 
-        return position, open_orders_response
+    def _sync_intent_from_order_info(self, intent: Dict[str, Any], order_info: Dict[str, Any]) -> bool:
+        """Synchronize one local intent from an authoritative exchange snapshot.
+
+        No synthetic fills are invented. REST cumulative executedQty is treated as
+        authoritative state; independently observed websocket fills remain in the
+        fills table and are used only for duplicate/late-fill conflict detection.
+        """
+        cid = intent["client_order_id"]
+        symbol = intent["symbol"]
+
+        if order_info.get("clientOrderId") not in (None, cid):
+            return False
+        if order_info.get("symbol") not in (None, symbol):
+            return False
+
+        mapped_state = self.adapter._map_order_state(str(order_info.get("status", "UNKNOWN")))
+        if mapped_state == OrderState.UNKNOWN:
+            return False
+
+        qty = self._finite_decimal(intent.get("quantity"))
+        persisted = self._finite_decimal(intent.get("filled_quantity", "0"))
+        executed = self._finite_decimal(order_info.get("executedQty"))
+        if qty is None or qty <= 0 or persisted is None or executed is None:
+            return False
+        if persisted < 0 or executed < 0 or persisted > qty or executed > qty:
+            return False
+        # Exchange cumulative quantity must never move backwards relative to
+        # already-persisted authoritative state.
+        if executed < persisted:
+            return False
+
+        if mapped_state == OrderState.OPEN and executed != 0:
+            return False
+        if mapped_state == OrderState.PARTIALLY_FILLED and not (Decimal("0") < executed < qty):
+            return False
+        if mapped_state == OrderState.FILLED and executed != qty:
+            return False
+
+        avg_price = self._finite_decimal(order_info.get("avgPrice", "0"))
+        if avg_price is not None and avg_price < 0:
+            return False
+        self.persistence.sync_filled_quantity(
+            cid, executed, avg_price if avg_price is not None else None)
+        self.persistence.update_intent_status(
+            cid,
+            mapped_state,
+            str(order_info["orderId"]) if order_info.get("orderId") is not None else intent.get("exchange_order_id"),
+            raw_status=str(order_info.get("status", "UNKNOWN")),
+        )
+        return True
 
     def resolve_state(self, symbol: str) -> bool:
-        """
-        Attempts to reconcile local state with exchange state.
-        Returns True if successful, False if a corrupt/unrecoverable state is detected (should transition to HALTED).
-        """
+        """Reconcile persistence, exchange and RiskEngine; fail closed on ambiguity."""
         try:
             position, exchange_orders = self.fetch_exchange_state(symbol)
         except Exception:
-            # If network fails, we can't reconcile
             return False
 
-        try:
-            self.last_position_amount = Decimal(str(position.get("positionAmt", "0")))
-            if self.last_position_amount.is_nan() or self.last_position_amount.is_infinite():
+        position_amount = self._finite_decimal(position.get("positionAmt", "0"))
+        if position_amount is None:
+            return False
+        self.last_position_amount = position_amount
+
+        # Duplicate/invalid client ids in one exchange snapshot are treated as
+        # corrupt/ambiguous rather than silently overwritten by a dict.
+        exchange_orders_by_cid: Dict[str, Dict[str, Any]] = {}
+        for order in exchange_orders:
+            cid = order.get("clientOrderId")
+            if not cid or cid in exchange_orders_by_cid:
                 return False
-        except Exception:
-            return False
+            exchange_orders_by_cid[cid] = order
 
-        exchange_orders_by_cid = {order["clientOrderId"]: order for order in exchange_orders}
+        local_symbol_intents = [
+            intent for intent in self.persistence.get_all_intents()
+            if intent.get("symbol") == symbol
+        ]
 
-        # 1. Handle UNKNOWN orders first by explicitly querying them
-        all_intents = self.persistence.get_all_intents()
-        for intent in all_intents:
-            if intent["status"] == "UNKNOWN":
-                cid = intent["client_order_id"]
-                try:
-                    order_info = self.adapter.query_order(symbol, cid)
-                    # If query successful, it exists. Update status based on Binance status
-                    mapped_state = self.adapter._map_order_state(order_info["status"])
-                    if mapped_state == OrderState.UNKNOWN:
+        # 1. Resolve UNKNOWN submissions individually.
+        for intent in local_symbol_intents:
+            if intent["status"] != "UNKNOWN":
+                continue
+            cid = intent["client_order_id"]
+            try:
+                order_info = self.adapter.query_order(symbol, cid)
+            except Exception as exc:
+                text = str(exc)
+                if "-2013" in text or "Order does not exist" in text:
+                    # For a submission whose outcome was UNKNOWN, an explicit
+                    # exchange "does not exist" result is accepted only if we
+                    # have never persisted a fill for it.
+                    persisted = self._finite_decimal(intent.get("filled_quantity", "0"))
+                    observed = self.persistence.get_recorded_fill_total(cid)
+                    if persisted != Decimal("0") or observed != Decimal("0"):
                         return False
+                    self.persistence.update_intent_status(cid, OrderState.CANCELED, raw_status="NOT_FOUND")
+                    exchange_orders_by_cid.pop(cid, None)
+                    continue
+                return False
 
-                    # Update fill information if any
-                    executed_qty = Decimal(str(order_info.get("executedQty", "0")))
-                    if executed_qty > Decimal("0"):
-                        # Just append a singular fill for the total amount as a reconciliation simplification.
-                        # Real event processing handles multiple fills cleanly.
-                        self.persistence.add_fill(f"reconcile_fill_{cid}", cid, executed_qty, Decimal(str(order_info.get("avgPrice", "0"))))
+            if not self._sync_intent_from_order_info(intent, order_info):
+                return False
+            mapped = self.adapter._map_order_state(str(order_info.get("status", "UNKNOWN")))
+            if mapped in (OrderState.OPEN, OrderState.PARTIALLY_FILLED):
+                exchange_orders_by_cid[cid] = order_info
+            else:
+                exchange_orders_by_cid.pop(cid, None)
 
-                    self.persistence.update_intent_status(cid, mapped_state, str(order_info.get("orderId")))
-                    # Update local exchange_orders dict if it's still open
-                    if mapped_state in (OrderState.OPEN, OrderState.PARTIALLY_FILLED):
-                        exchange_orders_by_cid[cid] = order_info
-                except Exception as e:
-                    # Depending on error, it might be that the order doesn't exist
-                    # For Binance, "Order does not exist" is a specific code (-2013)
-                    error_msg = str(e)
-                    if "-2013" in error_msg or "Order does not exist" in error_msg:
-                        # Order was not placed, safely mark as CANCELED or REJECTED
-                        self.persistence.update_intent_status(cid, OrderState.CANCELED)
-                    else:
-                        # Unexpected error, cannot reconcile safely
-                        return False
-
-        # 2. Check all active local intents against exchange
-        active_intents = self.persistence.get_active_intents()
+        # 2. Every locally active intent must match an authoritative exchange
+        # open-order snapshot or a direct query.
+        active_intents = [
+            intent for intent in self.persistence.get_active_intents()
+            if intent.get("symbol") == symbol
+        ]
         for intent in active_intents:
             cid = intent["client_order_id"]
-            if cid not in exchange_orders_by_cid:
-                # Local thinks it's open, but exchange doesn't have it
-                # We should query it to know its final state (filled vs canceled)
+            if cid in exchange_orders_by_cid:
+                order_info = exchange_orders_by_cid[cid]
+            else:
                 try:
                     order_info = self.adapter.query_order(symbol, cid)
-                    mapped_state = self.adapter._map_order_state(order_info["status"])
-                    if mapped_state == OrderState.UNKNOWN:
-                        return False
+                except Exception:
+                    return False
+            if not self._sync_intent_from_order_info(intent, order_info):
+                return False
 
-                    executed_qty = Decimal(str(order_info.get("executedQty", "0")))
-                    current_filled = Decimal(intent["filled_quantity"])
-                    if executed_qty > current_filled:
-                        diff = executed_qty - current_filled
-                        self.persistence.add_fill(f"reconcile_fill_missing_{cid}", cid, diff, Decimal(str(order_info.get("avgPrice", "0"))))
+        # Refresh local view after UNKNOWN/active synchronization.
+        local_symbol_intents = [
+            intent for intent in self.persistence.get_all_intents()
+            if intent.get("symbol") == symbol
+        ]
+        local_cids = {intent["client_order_id"] for intent in local_symbol_intents}
 
-                    self.persistence.update_intent_status(cid, mapped_state, str(order_info.get("orderId")))
-                except Exception as e:
-                    error_msg = str(e)
-                    if "-2013" in error_msg or "Order does not exist" in error_msg:
-                        # Local thinks it's open, but it never existed? This is a corrupt state
-                        # OR it was canceled locally but db write failed.
-                        # We will fail closed/halt.
-                        return False
-                    else:
-                        return False
-            else:
-                # It is on exchange, and we think it's open. Sync quantities.
-                order_info = exchange_orders_by_cid[cid]
-                mapped_state = self.adapter._map_order_state(order_info["status"])
-                executed_qty = Decimal(str(order_info.get("executedQty", "0")))
-                current_filled = Decimal(intent["filled_quantity"])
-
-                if executed_qty > current_filled:
-                    diff = executed_qty - current_filled
-                    self.persistence.add_fill(f"reconcile_fill_active_{cid}", cid, diff, Decimal(str(order_info.get("avgPrice", "0"))))
-
-                self.persistence.update_intent_status(cid, mapped_state, str(order_info.get("orderId")))
-
-        # 3. Check for exchange-only orders (orders on exchange that we don't track)
-        local_cids = {intent["client_order_id"] for intent in self.persistence.get_all_intents()}
-        for cid, order in exchange_orders_by_cid.items():
+        # 3. Exchange-only orders are not ours to cancel or assume safe.
+        for cid in exchange_orders_by_cid:
             if cid not in local_cids:
                 return False
 
-        # 4. Rebuild the in-memory RiskEngine from the exact reconciled snapshot.
+        # 4. Rebuild RiskEngine from the same reconciled symbol snapshot.
         if self.risk_engine is not None:
-            intents = self.persistence.get_all_intents()
-            for intent in intents:
+            for intent in local_symbol_intents:
                 intent["observed_filled_quantity"] = str(
                     self.persistence.get_recorded_fill_total(intent["client_order_id"]))
             if not self.risk_engine.rebuild_from_authoritative_state(
-                    self.last_position_amount, intents):
+                    self.last_position_amount, local_symbol_intents):
                 return False
 
         return True

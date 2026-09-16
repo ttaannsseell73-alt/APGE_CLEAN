@@ -10,7 +10,7 @@ from apge.grid_strategy import MarketRegime
 
 class MockAdapter:
     def submit_limit_order(self, **kwargs):
-        return {"status": "NEW", "orderId": "ext_new", "clientOrderId": kwargs["client_order_id"]}
+        return {"status": "NEW", "orderId": "ext_new", "clientOrderId": kwargs["client_order_id"], "executedQty": "0"}
     def cancel_order(self, symbol, cid):
         return {"status": "CANCELED", "orderId": "ext_cancel", "clientOrderId": cid, "executedQty": "0"}
     def _map_order_state(self, status):
@@ -213,6 +213,7 @@ def test_inventory_fill_triggers_counter_order(runtime_setup):
         "trade_id": "trade_buy_1",
         "last_filled_qty": Decimal("5.0"),
         "last_filled_price": Decimal("99.0"),
+        "accumulated_filled_qty": Decimal("5.0"),
         "mapped_state": OrderState.FILLED,
         "order_status": "FILLED"
     })

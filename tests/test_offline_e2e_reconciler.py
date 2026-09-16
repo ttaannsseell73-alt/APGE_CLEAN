@@ -115,3 +115,45 @@ def test_reconciliation_rejects_snapshot_that_can_exceed_signed_limit():
         assert risk.system_state == SystemState.RECONCILING
     finally:
         db.close()
+
+
+
+def test_reconciliation_cumulative_fill_does_not_double_count_existing_fill():
+    db = Persistence()
+    db.save_intent("1", "BTCUSDT", "BUY", Decimal("2"), Decimal("100"), OrderState.UNKNOWN)
+    assert db.add_fill("real-fill", "1", Decimal("1"), Decimal("100"))
+
+    class Query(MockAdapter):
+        def query_order(self, symbol, cid):
+            return {"clientOrderId": cid, "symbol": symbol, "status": "PARTIALLY_FILLED", "executedQty": "1.5", "avgPrice": "100", "orderId": "ext1"}
+
+    adapter = Query(
+        positions=[{"symbol": "BTCUSDT", "positionAmt": "1.5", "entryPrice": "100"}],
+        open_orders=[])
+    risk = RiskEngine(Decimal("10"), require_explicit_side=True)
+    risk.system_state = SystemState.RECONCILING
+    reconciler = Reconciler(db, adapter, risk)
+    try:
+        assert reconciler.resolve_state("BTCUSDT") is True
+        assert Decimal(db.get_intent("1")["filled_quantity"]) == Decimal("1.5")
+        assert db.get_recorded_fill_total("1") == Decimal("1")
+        assert risk.current_position == Decimal("1.5")
+        assert risk.reservations == Decimal("0.5")
+    finally:
+        db.close()
+
+
+def test_reconciliation_rejects_backward_executed_quantity():
+    db = Persistence()
+    db.save_intent("1", "BTCUSDT", "BUY", Decimal("2"), Decimal("100"), OrderState.OPEN)
+    db.sync_filled_quantity("1", Decimal("1"), Decimal("100"))
+    adapter = MockAdapter(
+        positions=[{"symbol": "BTCUSDT", "positionAmt": "1", "entryPrice": "100"}],
+        open_orders=[{"clientOrderId": "1", "symbol": "BTCUSDT", "status": "PARTIALLY_FILLED", "executedQty": "0.5", "avgPrice": "100", "orderId": "ext1"}],
+    )
+    reconciler = Reconciler(db, adapter)
+    try:
+        assert reconciler.resolve_state("BTCUSDT") is False
+        assert Decimal(db.get_intent("1")["filled_quantity"]) == Decimal("1")
+    finally:
+        db.close()

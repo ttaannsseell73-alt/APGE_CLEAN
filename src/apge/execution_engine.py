@@ -135,12 +135,31 @@ class ExecutionEngine:
             # We return the cid so the caller knows it was attempted.
             return cid
 
-        # Parse success
+        # Parse an authoritative acknowledgement. Even a response containing
+        # orderId is fail-closed if its status/quantity is internally inconsistent.
         if "orderId" in response:
             mapped_state = self.adapter._map_order_state(raw_status)
-            self.persistence.update_intent_status(cid, mapped_state, str(response["orderId"]), raw_status=raw_status)
-            # Provide feedback to RiskEngine about the actual state to clear the UNKNOWN gate
-            self.risk_engine.resolve_order(cid, mapped_state, Decimal("0.0"))
+            final_filled = self._authoritative_filled_qty(response.get("executedQty"))
+            if mapped_state == OrderState.UNKNOWN or final_filled is None:
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, str(response["orderId"]), raw_status=raw_status)
+                self.risk_engine.restore_connection()
+                return cid
+
+            if not self.risk_engine.resolve_order(cid, mapped_state, final_filled):
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, str(response["orderId"]), raw_status=raw_status)
+                self.risk_engine.restore_connection()
+                return cid
+
+            if not self._sync_authoritative_fill_total(
+                    cid, final_filled, response.get("avgPrice")):
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, str(response["orderId"]), raw_status=raw_status)
+                return cid
+
+            self.persistence.update_intent_status(
+                cid, mapped_state, str(response["orderId"]), raw_status=raw_status)
             return cid
 
         # It was rejected by the exchange
@@ -150,6 +169,7 @@ class ExecutionEngine:
         # The prompt says: "Preserve order-state semantics strictly: never map REJECTED to CANCELED. Map to UNKNOWN or preserve raw status if the target enum lacks a specific REJECTED state."
         # So we map to UNKNOWN since OrderState doesn't have REJECTED.
         self.persistence.update_intent_status(cid, OrderState.UNKNOWN, raw_status=raw_status)
+        self.risk_engine.restore_connection()
         return None
 
     def cancel_order(self, symbol: str, client_order_id: str) -> bool:
@@ -219,25 +239,61 @@ class ExecutionEngine:
         mapped_state = update["mapped_state"]
         raw_status = update["order_status"]
 
-        # If it's a fill, apply it safely
+        # If it's a fill, apply it safely. Persistence and RiskEngine must
+        # describe the same tracked order before any mutation is allowed.
         if update["execution_type"] == "TRADE":
+            if cid not in self.risk_engine.orders:
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, intent.get("exchange_order_id"), raw_status=raw_status)
+                self.risk_engine.restore_connection()
+                return
             trade_id = update.get("trade_id")
             if trade_id:
                 filled_qty = update["last_filled_qty"]
                 filled_price = update["last_filled_price"]
 
                 if filled_qty > Decimal("0"):
-                    # This handles duplicates internally by checking fill_id
-                    fill_applied = self.persistence.add_fill(
-                        fill_id=f"ws_fill_{trade_id}",
-                        client_order_id=cid,
-                        quantity=filled_qty,
-                        price=filled_price
-                    )
-                    if fill_applied:
+                    persistence_fill_id = f"ws_fill_{trade_id}"
+                    duplicate = self.persistence.has_fill(persistence_fill_id)
+                    try:
+                        total_qty = Decimal(str(intent["quantity"]))
+                        persisted_filled = Decimal(str(intent["filled_quantity"]))
+                        cumulative = self._authoritative_filled_qty(update.get("accumulated_filled_qty"))
+                    except Exception:
+                        cumulative = None
+                        total_qty = Decimal("-1")
+                        persisted_filled = Decimal("-1")
+
+                    expected_cumulative = (
+                        persisted_filled if duplicate else persisted_filled + filled_qty)
+                    if (filled_qty.is_nan() or filled_qty.is_infinite() or
+                            total_qty <= 0 or persisted_filled < 0 or
+                            expected_cumulative > total_qty or cumulative is None or
+                            cumulative != expected_cumulative):
+                        self.persistence.update_intent_status(
+                            cid, OrderState.UNKNOWN, intent.get("exchange_order_id"), raw_status=raw_status)
+                        if not duplicate:
+                            # Let RiskEngine record an overfill conflict when applicable.
+                            self.risk_engine.on_fill(
+                                order_id=cid, fill_id=str(trade_id), amount=filled_qty)
+                        self.risk_engine.restore_connection()
+                        return
+
+                    if not duplicate:
+                        fill_applied = self.persistence.add_fill(
+                            fill_id=persistence_fill_id,
+                            client_order_id=cid,
+                            quantity=filled_qty,
+                            price=filled_price
+                        )
+                        if not fill_applied:
+                            self.persistence.update_intent_status(
+                                cid, OrderState.UNKNOWN, intent.get("exchange_order_id"), raw_status=raw_status)
+                            self.risk_engine.restore_connection()
+                            return
                         logger.info(f"Applied fill {filled_qty} @ {filled_price} for {cid}")
-                        # Tell risk engine to release risk for this fill amount
-                        self.risk_engine.on_fill(order_id=cid, fill_id=str(trade_id), amount=filled_qty)
+                        self.risk_engine.on_fill(
+                            order_id=cid, fill_id=str(trade_id), amount=filled_qty)
 
         # A CANCELED websocket update is terminal only with a consistent
         # authoritative cumulative fill quantity.

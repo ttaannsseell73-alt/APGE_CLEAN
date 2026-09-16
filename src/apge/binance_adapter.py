@@ -47,6 +47,7 @@ class BinanceAdapter:
         self.api_key = api_key
         self.api_secret = api_secret
         self.clock = clock or time.time
+        self.server_time_offset = 0
 
     def _generate_signature(self, query_string: str) -> str:
         """Generate deterministic HMAC SHA256 signature."""
@@ -68,7 +69,7 @@ class BinanceAdapter:
 
         # Ensure timestamp is present
         if "timestamp" not in params_copy:
-            params_copy["timestamp"] = int(self.clock() * 1000)
+            params_copy["timestamp"] = int(self.clock() * 1000) + int(self.server_time_offset)
 
         # Filter out None values and create a sorted query string
         query_params = [(k, str(v)) for k, v in sorted(params_copy.items()) if v is not None]

@@ -61,7 +61,7 @@ class CancelAdapter:
         self.cancel_response = dict(cancel_response)
 
     def submit_limit_order(self, **kwargs):
-        return {"status": "NEW", "orderId": "ext-new", "clientOrderId": kwargs["client_order_id"]}
+        return {"status": "NEW", "orderId": "ext-new", "clientOrderId": kwargs["client_order_id"], "executedQty": "0"}
 
     def cancel_order(self, symbol, cid):
         response = dict(self.cancel_response)
@@ -164,7 +164,7 @@ class GridAdapter(CancelAdapter):
 
     def submit_limit_order(self, **kwargs):
         self.submissions.append(dict(kwargs))
-        return {"status": "NEW", "orderId": f"ext-{len(self.submissions)}", "clientOrderId": kwargs["client_order_id"]}
+        return {"status": "NEW", "orderId": f"ext-{len(self.submissions)}", "clientOrderId": kwargs["client_order_id"], "executedQty": "0"}
 
     def parse_book_ticker(self, payload):
         return {
@@ -310,3 +310,115 @@ def test_authoritative_rebuild_restores_position_orders_and_reservations():
     assert engine.orders["s"].state == OrderState.PARTIALLY_FILLED
     assert engine.orders["c"].cancel_confirmed_total == Decimal("0.5")
     assert engine.orders["c"].seen_fills_sum == Decimal("0.25")
+
+
+
+def test_resolve_order_supports_partial_and_rejects_incoherent_state():
+    engine = RiskEngine(Decimal("10"), require_explicit_side=True)
+    approval = engine.request_approval(Decimal("2"), symbol="BTCUSDT", side="SELL")
+    assert approval is not None
+    assert engine.consume_approval_and_submit(approval, "s", symbol="BTCUSDT", side="SELL")
+    assert engine.resolve_order("s", OrderState.PARTIALLY_FILLED, Decimal("1")) is True
+    assert engine.orders["s"].state == OrderState.PARTIALLY_FILLED
+    assert engine.current_position == Decimal("-1")
+    assert engine.reservations == Decimal("1")
+
+    bad = RiskEngine(Decimal("10"), require_explicit_side=True)
+    approval = bad.request_approval(Decimal("2"), symbol="BTCUSDT", side="BUY")
+    assert approval is not None
+    assert bad.consume_approval_and_submit(approval, "b", symbol="BTCUSDT", side="BUY")
+    assert bad.resolve_order("b", OrderState.FILLED, Decimal("1")) is False
+    assert bad.system_state == SystemState.RECONCILING
+    assert bad.reservations == Decimal("2")
+
+
+def test_server_time_offset_changes_signed_timestamp():
+    from apge.binance_adapter import BinanceAdapter
+
+    class NoopTransport:
+        pass
+
+    adapter = BinanceAdapter(
+        NoopTransport(),
+        "https://testnet.binancefuture.com",
+        "wss://fstream.binancefuture.com",
+        "k", "s", clock=lambda: 1000.0)
+    adapter.server_time_offset = 250
+    params = adapter._prepare_signed_params({"symbol": "BTCUSDT"})
+    assert params["timestamp"] == "1000250"
+
+
+def test_persistence_rejects_overfill_before_mutation():
+    db = Persistence()
+    try:
+        db.save_intent("x", "BTCUSDT", "BUY", Decimal("1"), Decimal("100"), OrderState.OPEN)
+        assert db.add_fill("f1", "x", Decimal("0.75"), Decimal("100")) is True
+        assert db.add_fill("f2", "x", Decimal("0.50"), Decimal("100")) is False
+        assert Decimal(db.get_intent("x")["filled_quantity"]) == Decimal("0.75")
+        assert db.get_recorded_fill_total("x") == Decimal("0.75")
+    finally:
+        db.close()
+
+
+def test_submit_ack_filled_applies_signed_position_and_releases_risk():
+    class FilledAdapter(CancelAdapter):
+        def __init__(self):
+            super().__init__({"status": "CANCELED", "orderId": "unused", "executedQty": "0"})
+        def submit_limit_order(self, **kwargs):
+            return {"status": "FILLED", "orderId": "filled-now", "executedQty": str(kwargs["quantity"]), "avgPrice": str(kwargs["price"])}
+
+    db = Persistence()
+    risk = RiskEngine(Decimal("10"), require_explicit_side=True)
+    execution = ExecutionEngine(db, FilledAdapter(), risk)
+    try:
+        cid = execution.execute_proposal("BTCUSDT", OrderProposal("SELL", Decimal("100"), Decimal("2")))
+        assert cid is not None
+        assert risk.current_position == Decimal("-2")
+        assert risk.reservations == Decimal("0")
+        assert risk.orders[cid].state == OrderState.FILLED
+        assert db.get_intent(cid)["status"] == "FILLED"
+        assert Decimal(db.get_intent(cid)["filled_quantity"]) == Decimal("2")
+    finally:
+        db.close()
+
+
+def test_submit_ack_unknown_status_forces_reconciliation():
+    class WeirdAdapter(CancelAdapter):
+        def __init__(self):
+            super().__init__({"status": "CANCELED", "orderId": "unused", "executedQty": "0"})
+        def submit_limit_order(self, **kwargs):
+            return {"status": "EXPIRED", "orderId": "weird", "executedQty": "0"}
+
+    db = Persistence()
+    risk = RiskEngine(Decimal("10"), require_explicit_side=True)
+    execution = ExecutionEngine(db, WeirdAdapter(), risk)
+    try:
+        cid = execution.execute_proposal("BTCUSDT", OrderProposal("BUY", Decimal("100"), Decimal("1")))
+        assert cid is not None
+        assert risk.system_state == SystemState.RECONCILING
+        assert db.get_intent(cid)["status"] == "UNKNOWN"
+        assert risk.reservations == Decimal("1")
+    finally:
+        db.close()
+
+
+def test_ws_trade_cumulative_mismatch_fails_closed_without_persistence_overcount():
+    db, risk, execution, cid = _engine_with_order(
+        {"status": "CANCELED", "orderId": "unused", "executedQty": "0"},
+        side="BUY", qty="1")
+    try:
+        execution.handle_order_update({
+            "client_order_id": cid,
+            "execution_type": "TRADE",
+            "trade_id": "bad-cumulative",
+            "last_filled_qty": Decimal("0.6"),
+            "last_filled_price": Decimal("100"),
+            "accumulated_filled_qty": Decimal("0.8"),
+            "mapped_state": OrderState.PARTIALLY_FILLED,
+            "order_status": "PARTIALLY_FILLED",
+        })
+        assert risk.system_state == SystemState.RECONCILING
+        assert Decimal(db.get_intent(cid)["filled_quantity"]) == Decimal("0")
+        assert db.get_intent(cid)["status"] == "UNKNOWN"
+    finally:
+        db.close()

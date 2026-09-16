@@ -696,55 +696,62 @@ class RiskEngine:
     # -- Order state helpers (for reconciliation use) ------------------------
 
     def resolve_order(self, order_id: str, final_state: OrderState,
-                      final_filled: Decimal):
-        """Resolve an UNKNOWN order during reconciliation.
-
-        This is called when the exchange confirms the true status of an
-        order via Client Order ID lookup.
-        Validates that final_filled is within [0, initial_amount].
-        """
+                      final_filled: Decimal) -> bool:
+        """Resolve an UNKNOWN order from authoritative exchange state."""
         with self._lock:
             if not self._is_valid_non_negative(final_filled):
                 self._enter_reconciling()
-                return
-
+                return False
             if order_id not in self.orders:
-                return
+                self._enter_reconciling()
+                return False
+
             order = self.orders[order_id]
             if order.state != OrderState.UNKNOWN:
-                return
-
-            # --- Bounds check (Bug 5) ---
-            if final_filled > order.initial_amount:
-                # Inconsistent data — do not consider this a definitive resolution
-                # and do NOT release any reservations. Preserve worst-case risk.
+                return order.state == final_state and order.filled_amount == final_filled
+            if final_filled > order.initial_amount or final_filled < order.filled_amount:
                 self.unresolved_conflicts.add(order_id)
                 self._enter_reconciling()
                 self._bump_risk_version()
-                return
+                return False
 
-            if final_state == OrderState.FILLED:
-                diff = final_filled - order.filled_amount
-                if diff > 0:
-                    order.filled_amount += diff
-                    self.current_position += self._position_delta(order, diff)
-                    self.reservations -= diff
-                order.state = OrderState.FILLED
+            if final_state == OrderState.OPEN:
+                valid_state = final_filled == Decimal('0')
+            elif final_state == OrderState.PARTIALLY_FILLED:
+                valid_state = Decimal('0') < final_filled < order.initial_amount
+            elif final_state == OrderState.FILLED:
+                valid_state = final_filled == order.initial_amount
             elif final_state == OrderState.CANCELED:
-                order.state = OrderState.CANCELED
+                valid_state = Decimal('0') <= final_filled <= order.initial_amount
+            else:
+                valid_state = False
+
+            if not valid_state:
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                self._bump_risk_version()
+                return False
+
+            diff = final_filled - order.filled_amount
+            if diff > 0:
+                order.filled_amount += diff
+                self.current_position += self._position_delta(order, diff)
+                self.reservations -= diff
+
+            if final_state == OrderState.CANCELED:
+                order.cancel_requested = True
                 order.cancel_confirmed_total = final_filled
-                diff = final_filled - order.filled_amount
-                if diff > 0:
-                    order.filled_amount += diff
-                    self.current_position += self._position_delta(order, diff)
-                    self.reservations -= diff
                 remaining = order.initial_amount - order.filled_amount
                 if remaining > 0:
                     self.reservations -= remaining
-            elif final_state == OrderState.OPEN:
-                order.state = OrderState.OPEN
 
+            order.state = final_state
+            if self.reservations < 0:
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                return False
             self._bump_risk_version()
+            return True
 
     def resolve_conflict(self, order_id: str, final_filled: Decimal):
         """Resolve a persistent data conflict with verified reconciliation data.

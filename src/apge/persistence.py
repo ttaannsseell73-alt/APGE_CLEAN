@@ -110,32 +110,40 @@ class Persistence:
 
     def add_fill(self, fill_id: str, client_order_id: str, quantity: Decimal, price: Decimal):
         with self.conn:
-            # Check if fill_id already exists to prevent duplicate fill application
-            row = self.conn.execute("SELECT 1 FROM fills WHERE fill_id = ?", (fill_id,)).fetchone()
-            if row:
-                return False # Duplicate
+            if (not isinstance(quantity, Decimal) or quantity.is_nan() or
+                    quantity.is_infinite() or quantity <= 0):
+                return False
+            if (not isinstance(price, Decimal) or price.is_nan() or
+                    price.is_infinite() or price < 0):
+                return False
+
+            if self.conn.execute("SELECT 1 FROM fills WHERE fill_id = ?", (fill_id,)).fetchone():
+                return False
+
+            intent_row = self.conn.execute(
+                "SELECT quantity, filled_quantity, average_price FROM intents WHERE client_order_id = ?",
+                (client_order_id,)).fetchone()
+            if not intent_row:
+                return False
+
+            order_qty = Decimal(intent_row['quantity'])
+            old_filled = Decimal(intent_row['filled_quantity'])
+            old_avg_price = Decimal(intent_row['average_price'])
+            new_filled = old_filled + quantity
+            if new_filled > order_qty:
+                return False
 
             self.conn.execute("""
                 INSERT INTO fills (fill_id, client_order_id, quantity, price)
                 VALUES (?, ?, ?, ?)
             """, (fill_id, client_order_id, str(quantity), str(price)))
 
-            # Update intent filled_quantity and average_price
-            intent_row = self.conn.execute("SELECT filled_quantity, average_price FROM intents WHERE client_order_id = ?", (client_order_id,)).fetchone()
-            if intent_row:
-                old_filled = Decimal(intent_row['filled_quantity'])
-                old_avg_price = Decimal(intent_row['average_price'])
-
-                new_filled = old_filled + quantity
-
-                # new_avg = (old_avg * old_filled + price * quantity) / new_filled
-                total_value = (old_avg_price * old_filled) + (price * quantity)
-                new_avg_price = total_value / new_filled if new_filled > 0 else Decimal('0')
-
-                self.conn.execute("""
-                    UPDATE intents SET filled_quantity = ?, average_price = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE client_order_id = ?
-                """, (str(new_filled), str(new_avg_price), client_order_id))
+            total_value = (old_avg_price * old_filled) + (price * quantity)
+            new_avg_price = total_value / new_filled if new_filled > 0 else Decimal('0')
+            self.conn.execute("""
+                UPDATE intents SET filled_quantity = ?, average_price = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE client_order_id = ?
+            """, (str(new_filled), str(new_avg_price), client_order_id))
             return True
 
     def sync_filled_quantity(self, client_order_id: str, cumulative_quantity: Decimal, average_price: Optional[Decimal] = None):
@@ -157,6 +165,11 @@ class Persistence:
             "SELECT quantity FROM fills WHERE client_order_id = ?", (client_order_id,)
         ).fetchall()
         return sum((Decimal(row["quantity"]) for row in rows), Decimal("0"))
+
+    def has_fill(self, fill_id: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM fills WHERE fill_id = ?", (fill_id,)
+        ).fetchone() is not None
 
     def update_runtime_state(self, key: str, value: str):
         with self.conn:
