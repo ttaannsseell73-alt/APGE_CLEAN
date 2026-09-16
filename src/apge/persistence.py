@@ -1,0 +1,152 @@
+import sqlite3
+import threading
+from typing import Dict, Any, List, Optional
+from decimal import Decimal
+
+from apge.simulator import OrderState
+
+class Persistence:
+    """
+    Deterministic SQLite-based persistence layer.
+    """
+    def __init__(self, db_path: str = ":memory:"):
+        self.db_path = db_path
+        self._local = threading.local()
+        self._init_db()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, 'conn'):
+            self._local.conn = sqlite3.connect(self.db_path)
+            self._local.conn.execute("PRAGMA foreign_keys = ON")
+            self._local.conn.row_factory = sqlite3.Row
+        return self._local.conn
+
+    def close(self):
+        if hasattr(self._local, 'conn'):
+            self._local.conn.close()
+            delattr(self._local, 'conn')
+
+    def _init_db(self):
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS intents (
+                    client_order_id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    raw_exchange_status TEXT,
+                    exchange_order_id TEXT,
+                    filled_quantity TEXT DEFAULT '0',
+                    average_price TEXT DEFAULT '0',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS fills (
+                    fill_id TEXT PRIMARY KEY,
+                    client_order_id TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(client_order_id) REFERENCES intents(client_order_id)
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS runtime_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+
+    def save_intent(self, client_order_id: str, symbol: str, side: str, quantity: Decimal, price: Decimal, status: OrderState):
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO intents (client_order_id, symbol, side, quantity, price, status, raw_exchange_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (client_order_id, symbol, side, str(quantity), str(price), status.name, "NEW"))
+
+    def update_intent_status(self, client_order_id: str, status: OrderState, exchange_order_id: Optional[str] = None, raw_status: Optional[str] = None):
+        with self.conn:
+            if exchange_order_id and raw_status:
+                self.conn.execute("""
+                    UPDATE intents SET status = ?, exchange_order_id = ?, raw_exchange_status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (status.name, exchange_order_id, raw_status, client_order_id))
+            elif exchange_order_id:
+                self.conn.execute("""
+                    UPDATE intents SET status = ?, exchange_order_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (status.name, exchange_order_id, client_order_id))
+            elif raw_status:
+                self.conn.execute("""
+                    UPDATE intents SET status = ?, raw_exchange_status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (status.name, raw_status, client_order_id))
+            else:
+                self.conn.execute("""
+                    UPDATE intents SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (status.name, client_order_id))
+
+    def get_intent(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM intents WHERE client_order_id = ?", (client_order_id,)).fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def get_active_intents(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("""
+            SELECT * FROM intents WHERE status NOT IN ('FILLED', 'CANCELED', 'REJECTED')
+        """).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_all_intents(self) -> List[Dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM intents").fetchall()
+        return [dict(row) for row in rows]
+
+    def add_fill(self, fill_id: str, client_order_id: str, quantity: Decimal, price: Decimal):
+        with self.conn:
+            # Check if fill_id already exists to prevent duplicate fill application
+            row = self.conn.execute("SELECT 1 FROM fills WHERE fill_id = ?", (fill_id,)).fetchone()
+            if row:
+                return False # Duplicate
+
+            self.conn.execute("""
+                INSERT INTO fills (fill_id, client_order_id, quantity, price)
+                VALUES (?, ?, ?, ?)
+            """, (fill_id, client_order_id, str(quantity), str(price)))
+
+            # Update intent filled_quantity and average_price
+            intent_row = self.conn.execute("SELECT filled_quantity, average_price FROM intents WHERE client_order_id = ?", (client_order_id,)).fetchone()
+            if intent_row:
+                old_filled = Decimal(intent_row['filled_quantity'])
+                old_avg_price = Decimal(intent_row['average_price'])
+
+                new_filled = old_filled + quantity
+
+                # new_avg = (old_avg * old_filled + price * quantity) / new_filled
+                total_value = (old_avg_price * old_filled) + (price * quantity)
+                new_avg_price = total_value / new_filled if new_filled > 0 else Decimal('0')
+
+                self.conn.execute("""
+                    UPDATE intents SET filled_quantity = ?, average_price = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (str(new_filled), str(new_avg_price), client_order_id))
+            return True
+
+    def update_runtime_state(self, key: str, value: str):
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO runtime_state (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """, (key, value))
+
+    def get_runtime_state(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
+        if row:
+            return row['value']
+        return None
