@@ -25,6 +25,34 @@ def _flat_candles(count: int, *, wide: bool = True):
     return rows
 
 
+def _loss_candles():
+    rows = _flat_candles(5, wide=False)
+    ts = rows[-1].timestamp_ms + 60_000
+    # Previous closes are flat at 100. The next candle crosses passive BUY
+    # levels, never reaches passive SELL levels, and closes materially lower.
+    rows.append(
+        Candle(
+            timestamp_ms=ts,
+            open=D("100"),
+            high=D("100.00"),
+            low=D("98.00"),
+            close=D("98.00"),
+        )
+    )
+    for i in range(4):
+        ts += 60_000
+        rows.append(
+            Candle(
+                timestamp_ms=ts,
+                open=D("98"),
+                high=D("98.01"),
+                low=D("97.99"),
+                close=D("98"),
+            )
+        )
+    return rows
+
+
 def test_backtest_is_deterministic_and_respects_inventory_cap():
     cfg = BacktestConfig(
         initial_cash=D("10000"),
@@ -56,6 +84,7 @@ def test_no_cross_no_fill():
 
 def test_guard_halts_research_run_after_loss_threshold():
     cfg = BacktestConfig(
+        initial_cash=D("100"),
         min_history=4,
         maker_fee_rate=D("0.001"),
         guard=GuardLimits(
@@ -64,7 +93,7 @@ def test_guard_halts_research_run_after_loss_threshold():
             max_consecutive_errors=3,
         ),
     )
-    result, _ = AdaptiveBacktester(cfg).run(_flat_candles(20))
+    result, _ = AdaptiveBacktester(cfg).run(_loss_candles())
     assert result.halted
     assert result.halt_reason == "DAILY_LOSS"
 
