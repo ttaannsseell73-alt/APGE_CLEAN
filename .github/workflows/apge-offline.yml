@@ -1,0 +1,38 @@
+name: APGE Offline Gate
+
+on:
+  push:
+    branches:
+      - apge-03-controlled-grid-validation
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependency
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Collect tests
+        env:
+          PYTHONPATH: src
+        run: python -m pytest --collect-only -q
+
+      - name: Run offline suite
+        env:
+          PYTHONPATH: src
+        run: python -m pytest -q
