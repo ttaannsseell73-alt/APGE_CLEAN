@@ -102,6 +102,8 @@ class TestnetRuntime:
     Exchange runtime around the accepted Binance adapter.
     Handles TESTNET validation, server time sync, loading exchange limits/filters.
     """
+    __test__ = False
+
     def __init__(self, adapter: BinanceAdapter):
         self.adapter = adapter
         self.server_time_offset: int = 0
