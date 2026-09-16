@@ -1,0 +1,71 @@
+name: APGE-03 One-shot Implementation V2
+
+on:
+  push:
+    branches:
+      - apge-03-controlled-grid-validation
+
+permissions:
+  contents: write
+
+jobs:
+  implement:
+    if: contains(github.event.head_commit.message, '[apge03-runner-v2]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reuse APGE-03 patch script and normalize generated test file
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/apge03-implement.yml').read_text()
+          marker_start = "          python - <<'PY'\n"
+          marker_end = "\n          PY\n"
+          start = workflow.index(marker_start) + len(marker_start)
+          end = workflow.index(marker_end, start)
+          body = workflow[start:end]
+          script = '\n'.join(
+              line[10:] if line.startswith('          ') else line
+              for line in body.splitlines()
+          )
+          exec(compile(script, 'apge03_embedded_patch.py', 'exec'))
+
+          test_path = Path('tests/test_apge03_hardening.py')
+          raw = test_path.read_text()
+          test_path.write_text(bytes(raw, 'utf-8').decode('unicode_escape'))
+          PY
+
+      - name: Install test dependency
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run APGE offline gate
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pytest --collect-only -q
+          python -m pytest -q
+
+      - name: Commit validated APGE-03 changes
+        shell: bash
+        run: |
+          git config user.name "APGE Automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add src tests
+          if git diff --cached --quiet; then
+            echo "No source changes to commit"
+            exit 0
+          fi
+          git commit -m "feat(apge): harden signed fills and cancel lifecycle"
+          git push origin HEAD:apge-03-controlled-grid-validation
