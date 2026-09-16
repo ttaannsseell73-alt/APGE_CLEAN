@@ -5,6 +5,7 @@ from typing import List
 
 from apge.simulator import SystemState
 
+
 class MarketRegime(Enum):
     NEUTRAL = auto()
     SLIGHT_UP = auto()
@@ -13,11 +14,13 @@ class MarketRegime(Enum):
     BREAKOUT = auto()
     SHOCK = auto()
 
+
 @dataclass(frozen=True)
 class OrderProposal:
     side: str
     price: Decimal
     quantity: Decimal
+
 
 def generate_grid_proposals(
     best_bid: Decimal,
@@ -31,19 +34,35 @@ def generate_grid_proposals(
     step_size: Decimal,
     system_state: SystemState,
     market_regime: MarketRegime,
-    is_stale_data: bool
+    is_stale_data: bool,
+    inventory_target: Decimal = Decimal("0"),
 ) -> List[OrderProposal]:
-    proposals = []
+    """Generate a deterministic bounded grid.
+
+    ``inventory_target`` tilts normal-operation capacity around a target inventory
+    without changing the hard absolute ``max_inventory`` bound. Defensive states
+    ignore the target and only allow orders that reduce actual inventory toward
+    zero.
+    """
+
+    proposals: List[OrderProposal] = []
 
     # Invalid BBA (crossed or zero)
     if best_bid >= best_ask or best_bid <= 0 or best_ask <= 0:
         return []
 
     # Invalid sizes
-    if base_size <= 0 or grid_spacing <= 0 or level_count <= 0:
+    if base_size <= 0 or grid_spacing <= 0 or level_count <= 0 or max_inventory <= 0:
         return []
 
     if tick_size <= 0 or step_size <= 0:
+        return []
+
+    if inventory_target.is_nan() or inventory_target.is_infinite():
+        return []
+    if abs(inventory_target) >= max_inventory:
+        # Keep a non-zero hard-cap buffer on both sides. A target equal to the
+        # absolute limit would remove one entire side of safety capacity.
         return []
 
     # Round base size down to step size
@@ -65,14 +84,49 @@ def generate_grid_proposals(
         risk_reducing_only = True
 
     if risk_reducing_only:
-        # Long capability (buying to cover short)
-        allowed_long_capacity = max(Decimal('0'), -current_inventory)
-        # Short capability (selling to cover long)
-        allowed_short_capacity = max(Decimal('0'), current_inventory)
+        # Defensive states reduce actual inventory toward zero. The adaptive
+        # inventory target is intentionally ignored here.
+        allowed_long_capacity = max(Decimal("0"), -current_inventory)
+        allowed_short_capacity = max(Decimal("0"), current_inventory)
     else:
-        # Normal operation
-        allowed_long_capacity = max(Decimal('0'), max_inventory - current_inventory)
-        allowed_short_capacity = max(Decimal('0'), max_inventory + current_inventory)
+        # Bias capacity around the target while retaining the hard absolute
+        # max_inventory bound. Example: positive target gives more BUY capacity
+        # and less SELL capacity without directly opening a directional order.
+        allowed_long_capacity = max(Decimal("0"), max_inventory - current_inventory)
+        allowed_short_capacity = max(Decimal("0"), max_inventory + current_inventory)
+
+        if inventory_target > 0:
+            allowed_long_capacity = min(
+                allowed_long_capacity,
+                max(Decimal("0"), (max_inventory - current_inventory)),
+            )
+            allowed_short_capacity = max(
+                Decimal("0"),
+                allowed_short_capacity - inventory_target,
+            )
+        elif inventory_target < 0:
+            allowed_short_capacity = min(
+                allowed_short_capacity,
+                max(Decimal("0"), (max_inventory + current_inventory)),
+            )
+            allowed_long_capacity = max(
+                Decimal("0"),
+                allowed_long_capacity + inventory_target,
+            )
+
+        # Ensure the target changes the center of allowable pending inventory,
+        # not the absolute hard cap. Capacity is limited by distance from target
+        # as well as distance from hard limits.
+        effective_inventory = current_inventory - inventory_target
+        effective_limit = max_inventory - abs(inventory_target)
+        allowed_long_capacity = min(
+            allowed_long_capacity,
+            max(Decimal("0"), effective_limit - effective_inventory),
+        )
+        allowed_short_capacity = min(
+            allowed_short_capacity,
+            max(Decimal("0"), effective_limit + effective_inventory),
+        )
 
     seen_bids = set()
     seen_asks = set()
@@ -82,7 +136,6 @@ def generate_grid_proposals(
         target_price = best_bid - (grid_spacing * i)
         target_price = (target_price // tick_size) * tick_size
 
-        # Ensure strict < best_ask (and < best_bid normally, but spacing * i > 0 so guaranteed unless tick_size rounds weirdly)
         if target_price >= best_bid:
             target_price = best_bid - tick_size
 
@@ -100,16 +153,15 @@ def generate_grid_proposals(
             proposals.append(OrderProposal("BUY", target_price, amount))
             allowed_long_capacity -= amount
             if allowed_long_capacity <= 0:
-                break # Reached long capacity
+                break
 
     # Generate Asks
     for i in range(1, level_count + 1):
         target_price = best_ask + (grid_spacing * i)
 
-        # round price to tick size. we round up for asks
         target_price = (target_price // tick_size) * tick_size
         if target_price < (best_ask + (grid_spacing * i)):
-           target_price += tick_size
+            target_price += tick_size
 
         if target_price <= best_ask:
             target_price = best_ask + tick_size
@@ -125,6 +177,6 @@ def generate_grid_proposals(
             proposals.append(OrderProposal("SELL", target_price, amount))
             allowed_short_capacity -= amount
             if allowed_short_capacity <= 0:
-                break # Reached short capacity
+                break
 
     return proposals
