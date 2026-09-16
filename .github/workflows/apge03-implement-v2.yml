@@ -25,7 +25,9 @@ jobs:
           python-version: '3.12'
 
       - name: Apply APGE-03 V4 hardening
-        run: python .github/scripts/apge03_v4.py
+        run: |
+          python .github/scripts/apge03_v4.py
+          python .github/scripts/apge03_v4_fix.py
 
       - name: Install test dependency
         run: python -m pip install --upgrade pip pytest
