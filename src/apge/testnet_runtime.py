@@ -232,10 +232,13 @@ class TestnetRuntime:
             self.execution_engine.risk_engine.system_state = SystemState.RECONCILING
             success = self.reconciler.resolve_state(self.symbol)
             if success:
-                logger.info("Reconciliation complete. Returning to OPERATIONAL.")
-                # Also refresh inventory
-                self.sync_inventory()
-                self.execution_engine.risk_engine.system_state = SystemState.OPERATIONAL
+                self.current_inventory = self.reconciler.last_position_amount
+                self.execution_engine.risk_engine.complete_reconciliation()
+                if self.execution_engine.risk_engine.system_state == SystemState.OPERATIONAL:
+                    logger.info("Reconciliation complete. Returning to OPERATIONAL.")
+                else:
+                    logger.error("Risk reconciliation did not reach OPERATIONAL. HALTING.")
+                    self.execution_engine.risk_engine.system_state = SystemState.HALTED
             else:
                 logger.error("Reconciliation failed upon reconnect. HALTING.")
                 self.execution_engine.risk_engine.system_state = SystemState.HALTED

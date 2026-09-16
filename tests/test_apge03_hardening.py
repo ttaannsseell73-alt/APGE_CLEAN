@@ -223,3 +223,90 @@ def test_deterministic_reprice_100_cycles_has_no_reservation_or_cid_leak():
         assert all(len(ids) == 2 for ids in seen_active_sets)
     finally:
         db.close()
+
+
+
+def test_side_aware_capacity_blocks_same_direction_overexposure():
+    engine = RiskEngine(Decimal("10"), require_explicit_side=True)
+    assert engine.rebuild_from_authoritative_state(Decimal("-9"), [])
+    assert engine.request_approval(Decimal("2"), symbol="BTCUSDT", side="SELL") is None
+    assert engine.request_approval(Decimal("1"), symbol="BTCUSDT", side="SELL") is not None
+
+    other = RiskEngine(Decimal("10"), require_explicit_side=True)
+    assert other.rebuild_from_authoritative_state(Decimal("9"), [])
+    assert other.request_approval(Decimal("2"), symbol="BTCUSDT", side="BUY") is None
+    assert other.request_approval(Decimal("1"), symbol="BTCUSDT", side="BUY") is not None
+
+
+def test_opposite_pending_orders_are_not_netted_for_worst_case_limit():
+    engine = RiskEngine(Decimal("10"), require_explicit_side=True)
+    assert engine.rebuild_from_authoritative_state(Decimal("0"), [])
+    buy = engine.request_approval(Decimal("8"), symbol="BTCUSDT", side="BUY")
+    sell = engine.request_approval(Decimal("8"), symbol="BTCUSDT", side="SELL")
+    assert buy is not None
+    assert sell is not None
+    assert engine.request_approval(Decimal("3"), symbol="BTCUSDT", side="BUY") is None
+    assert engine.request_approval(Decimal("3"), symbol="BTCUSDT", side="SELL") is None
+
+
+def test_cancel_authoritative_extra_fill_syncs_persistence_and_signed_risk():
+    db, risk, execution, cid = _engine_with_order(
+        {"status": "CANCELED", "orderId": "ext-cancel", "executedQty": "1.5", "avgPrice": "100"},
+        side="SELL", qty="2")
+    try:
+        execution.handle_order_update({
+            "client_order_id": cid,
+            "execution_type": "TRADE",
+            "trade_id": "seen-one",
+            "last_filled_qty": Decimal("1"),
+            "last_filled_price": Decimal("100"),
+            "accumulated_filled_qty": Decimal("1"),
+            "mapped_state": OrderState.PARTIALLY_FILLED,
+            "order_status": "PARTIALLY_FILLED",
+        })
+        assert execution.cancel_order("BTCUSDT", cid)
+        intent = db.get_intent(cid)
+        assert intent["status"] == "CANCELED"
+        assert Decimal(intent["filled_quantity"]) == Decimal("1.5")
+        assert risk.current_position == Decimal("-1.5")
+        assert risk.reservations == Decimal("0")
+    finally:
+        db.close()
+
+
+def test_missing_cancel_total_keeps_persistence_nonterminal_and_risk_reserved():
+    db, risk, execution, cid = _engine_with_order(
+        {"status": "CANCELED", "orderId": "ext-cancel"})
+    try:
+        assert execution.cancel_order("BTCUSDT", cid)
+        assert db.get_intent(cid)["status"] == "UNKNOWN"
+        assert risk.system_state == SystemState.RECONCILING
+        assert risk.reservations == Decimal("2")
+        assert risk.orders[cid].state == OrderState.OPEN
+    finally:
+        db.close()
+
+
+def test_contradictory_duplicate_cancel_fails_closed():
+    engine = RiskEngine(Decimal("10"), require_explicit_side=True)
+    _tracked_order(engine, "buy-1", "BUY", "2")
+    assert engine.on_cancel_confirmed("buy-1", Decimal("0")) is True
+    assert engine.on_cancel_confirmed("buy-1", Decimal("1")) is False
+    assert engine.system_state == SystemState.RECONCILING
+    assert "buy-1" in engine.unresolved_conflicts
+
+
+def test_authoritative_rebuild_restores_position_orders_and_reservations():
+    engine = RiskEngine(Decimal("10"), require_explicit_side=True)
+    intents = [
+        {"client_order_id": "b", "symbol": "BTCUSDT", "side": "BUY", "quantity": "2", "filled_quantity": "0", "observed_filled_quantity": "0", "status": "OPEN"},
+        {"client_order_id": "s", "symbol": "BTCUSDT", "side": "SELL", "quantity": "3", "filled_quantity": "1", "observed_filled_quantity": "1", "status": "PARTIALLY_FILLED"},
+        {"client_order_id": "c", "symbol": "BTCUSDT", "side": "BUY", "quantity": "1", "filled_quantity": "0.5", "observed_filled_quantity": "0.25", "status": "CANCELED"},
+    ]
+    assert engine.rebuild_from_authoritative_state(Decimal("-2"), intents)
+    assert engine.current_position == Decimal("-2")
+    assert engine.reservations == Decimal("4")
+    assert engine.orders["b"].side == "BUY"
+    assert engine.orders["s"].state == OrderState.PARTIALLY_FILLED
+    assert engine.orders["c"].cancel_confirmed_total == Decimal("0.5")
+    assert engine.orders["c"].seen_fills_sum == Decimal("0.25")

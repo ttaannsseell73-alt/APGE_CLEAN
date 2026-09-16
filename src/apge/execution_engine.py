@@ -33,6 +33,29 @@ class ExecutionEngine:
             return None
         return qty
 
+    def _sync_authoritative_fill_total(self, client_order_id: str, final_filled: Decimal, average_price: Any = None) -> bool:
+        intent = self.persistence.get_intent(client_order_id)
+        if not intent:
+            return False
+        try:
+            persisted = Decimal(str(intent.get("filled_quantity", "0")))
+        except Exception:
+            self.risk_engine.restore_connection()
+            return False
+        if final_filled < persisted:
+            self.risk_engine.restore_connection()
+            return False
+        avg = None
+        if average_price is not None:
+            try:
+                candidate = Decimal(str(average_price))
+                if not candidate.is_nan() and not candidate.is_infinite() and candidate >= 0:
+                    avg = candidate
+            except Exception:
+                avg = None
+        self.persistence.sync_filled_quantity(client_order_id, final_filled, avg)
+        return True
+
     def _generate_client_order_id(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> str:
         # Make deterministic based on intent and the number of PRIOR terminal orders matching this intent.
         # This prevents duplicate orders on retry (because the active order count wouldn't change if the previous failed to submit),
@@ -130,46 +153,55 @@ class ExecutionEngine:
         return None
 
     def cancel_order(self, symbol: str, client_order_id: str) -> bool:
-        """Request cancel without releasing risk until fill total is authoritative."""
+        """Request cancel; terminal local state requires an authoritative cumulative fill total."""
         intent = self.persistence.get_intent(client_order_id)
         if not intent:
             return False
-
         if intent["status"] in ("FILLED", "CANCELED", "REJECTED"):
             return False
 
-        # A cancel request never releases risk by itself.
         self.risk_engine.request_cancel(client_order_id)
-
         try:
             response = self.adapter.cancel_order(symbol, client_order_id)
         except Exception:
-            # Network/error ambiguity is a reconciliation event.
             self.risk_engine.restore_connection()
             raise
 
         raw_status = response.get("status", "UNKNOWN")
-
         if "orderId" not in response:
+            self.risk_engine.restore_connection()
+            self.persistence.update_intent_status(client_order_id, OrderState.UNKNOWN, raw_status=raw_status)
+            return False
+
+        exchange_order_id = str(response["orderId"])
+        mapped_state = self.adapter._map_order_state(raw_status)
+        if mapped_state != OrderState.CANCELED:
+            self.persistence.update_intent_status(
+                client_order_id, OrderState.UNKNOWN, exchange_order_id, raw_status=raw_status)
             self.risk_engine.restore_connection()
             return False
 
-        mapped_state = self.adapter._map_order_state(raw_status)
-        self.persistence.update_intent_status(
-            client_order_id, mapped_state, str(response["orderId"]), raw_status=raw_status)
-
-        if mapped_state == OrderState.CANCELED:
-            final_filled = self._authoritative_filled_qty(response.get("executedQty"))
-            if final_filled is None:
-                # Never guess zero. Keep reservation and reconcile.
-                self.risk_engine.restore_connection()
-            else:
-                self.risk_engine.on_cancel_confirmed(client_order_id, final_filled)
+        final_filled = self._authoritative_filled_qty(response.get("executedQty"))
+        if final_filled is None:
+            self.persistence.update_intent_status(
+                client_order_id, OrderState.UNKNOWN, exchange_order_id, raw_status=raw_status)
+            self.risk_engine.restore_connection()
             return True
 
-        # Any non-CANCELED cancel acknowledgement is uncertain.
-        self.risk_engine.restore_connection()
-        return False
+        if not self.risk_engine.on_cancel_confirmed(client_order_id, final_filled):
+            self.persistence.update_intent_status(
+                client_order_id, OrderState.UNKNOWN, exchange_order_id, raw_status=raw_status)
+            return True
+
+        if not self._sync_authoritative_fill_total(
+                client_order_id, final_filled, response.get("avgPrice")):
+            self.persistence.update_intent_status(
+                client_order_id, OrderState.UNKNOWN, exchange_order_id, raw_status=raw_status)
+            return True
+
+        self.persistence.update_intent_status(
+            client_order_id, OrderState.CANCELED, exchange_order_id, raw_status=raw_status)
+        return True
 
     def handle_order_update(self, update: Dict[str, Any]):
         """
@@ -207,15 +239,28 @@ class ExecutionEngine:
                         # Tell risk engine to release risk for this fill amount
                         self.risk_engine.on_fill(order_id=cid, fill_id=str(trade_id), amount=filled_qty)
 
-        # A CANCELED websocket update is authoritative only when its
-        # cumulative filled quantity is present and valid.
+        # A CANCELED websocket update is terminal only with a consistent
+        # authoritative cumulative fill quantity.
         if mapped_state == OrderState.CANCELED:
             final_filled = self._authoritative_filled_qty(
                 update.get("accumulated_filled_qty"))
             if final_filled is None:
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, intent.get("exchange_order_id"), raw_status=raw_status)
                 self.risk_engine.restore_connection()
-            else:
-                self.risk_engine.on_cancel_confirmed(cid, final_filled)
+                return
+            if not self.risk_engine.on_cancel_confirmed(cid, final_filled):
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, intent.get("exchange_order_id"), raw_status=raw_status)
+                return
+            if not self._sync_authoritative_fill_total(
+                    cid, final_filled, update.get("average_price")):
+                self.persistence.update_intent_status(
+                    cid, OrderState.UNKNOWN, intent.get("exchange_order_id"), raw_status=raw_status)
+                return
+            self.persistence.update_intent_status(
+                cid, OrderState.CANCELED, intent.get("exchange_order_id"), raw_status=raw_status)
+            return
 
         # Regardless of fill, update the final order state
         # But handle race condition: if it was already FILLED locally, a delayed CANCELED shouldn't overwrite it

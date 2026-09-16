@@ -1,14 +1,16 @@
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from decimal import Decimal
 
 from apge.persistence import Persistence
 from apge.binance_adapter import BinanceAdapter
-from apge.simulator import OrderState
+from apge.simulator import OrderState, RiskEngine
 
 class Reconciler:
-    def __init__(self, persistence: Persistence, adapter: BinanceAdapter):
+    def __init__(self, persistence: Persistence, adapter: BinanceAdapter, risk_engine: Optional[RiskEngine] = None):
         self.persistence = persistence
         self.adapter = adapter
+        self.risk_engine = risk_engine
+        self.last_position_amount = Decimal("0")
 
     def fetch_exchange_state(self, symbol: str) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """
@@ -41,6 +43,13 @@ class Reconciler:
             # If network fails, we can't reconcile
             return False
 
+        try:
+            self.last_position_amount = Decimal(str(position.get("positionAmt", "0")))
+            if self.last_position_amount.is_nan() or self.last_position_amount.is_infinite():
+                return False
+        except Exception:
+            return False
+
         exchange_orders_by_cid = {order["clientOrderId"]: order for order in exchange_orders}
 
         # 1. Handle UNKNOWN orders first by explicitly querying them
@@ -52,6 +61,8 @@ class Reconciler:
                     order_info = self.adapter.query_order(symbol, cid)
                     # If query successful, it exists. Update status based on Binance status
                     mapped_state = self.adapter._map_order_state(order_info["status"])
+                    if mapped_state == OrderState.UNKNOWN:
+                        return False
 
                     # Update fill information if any
                     executed_qty = Decimal(str(order_info.get("executedQty", "0")))
@@ -85,6 +96,8 @@ class Reconciler:
                 try:
                     order_info = self.adapter.query_order(symbol, cid)
                     mapped_state = self.adapter._map_order_state(order_info["status"])
+                    if mapped_state == OrderState.UNKNOWN:
+                        return False
 
                     executed_qty = Decimal(str(order_info.get("executedQty", "0")))
                     current_filled = Decimal(intent["filled_quantity"])
@@ -119,9 +132,16 @@ class Reconciler:
         local_cids = {intent["client_order_id"] for intent in self.persistence.get_all_intents()}
         for cid, order in exchange_orders_by_cid.items():
             if cid not in local_cids:
-                # Exchange-only order. We should not assume it's safe to take over if we didn't place it,
-                # or if our DB is completely wiped while we have live orders.
-                # Safe approach: HALT. Do not erase exchange orders merely to simplify recovery.
+                return False
+
+        # 4. Rebuild the in-memory RiskEngine from the exact reconciled snapshot.
+        if self.risk_engine is not None:
+            intents = self.persistence.get_all_intents()
+            for intent in intents:
+                intent["observed_filled_quantity"] = str(
+                    self.persistence.get_recorded_fill_total(intent["client_order_id"]))
+            if not self.risk_engine.rebuild_from_authoritative_state(
+                    self.last_position_amount, intents):
                 return False
 
         return True

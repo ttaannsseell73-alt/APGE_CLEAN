@@ -77,7 +77,7 @@ def main():
     risk_engine = RiskEngine(position_limit=Decimal("5.0"), require_explicit_side=True)
     risk_engine.system_state = SystemState.RECONCILING
     execution_engine = ExecutionEngine(db, adapter, risk_engine)
-    reconciler = Reconciler(db, adapter)
+    reconciler = Reconciler(db, adapter, risk_engine)
     runtime.attach_components(execution_engine, reconciler, args.symbol)
 
     if not dry_run:
@@ -98,15 +98,17 @@ def main():
             risk_engine.system_state = SystemState.HALTED
             sys.exit(1)
 
-        # Transition to operational
-        risk_engine.system_state = SystemState.OPERATIONAL
+        # Reconciler rebuilt RiskEngine from the same authoritative exchange snapshot.
+        runtime.current_inventory = reconciler.last_position_amount
+        risk_engine.complete_reconciliation()
+        if risk_engine.system_state != SystemState.OPERATIONAL:
+            logger.error("RiskEngine could not complete reconciliation. Halting.")
+            risk_engine.system_state = SystemState.HALTED
+            sys.exit(1)
         logger.info("System is OPERATIONAL. Starting event loops.")
 
-        # Start event loops
+        # Start event loops only after authoritative position/risk synchronization.
         runtime.start_event_loops("dummy_listen_key")
-
-        # Get actual starting inventory from REST positions
-        runtime.sync_inventory()
 
         try:
             for _ in range(5):

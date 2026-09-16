@@ -138,6 +138,26 @@ class Persistence:
                 """, (str(new_filled), str(new_avg_price), client_order_id))
             return True
 
+    def sync_filled_quantity(self, client_order_id: str, cumulative_quantity: Decimal, average_price: Optional[Decimal] = None):
+        """Persist an authoritative cumulative fill quantity without inventing a trade id."""
+        with self.conn:
+            if average_price is None:
+                self.conn.execute("""
+                    UPDATE intents SET filled_quantity = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (str(cumulative_quantity), client_order_id))
+            else:
+                self.conn.execute("""
+                    UPDATE intents SET filled_quantity = ?, average_price = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE client_order_id = ?
+                """, (str(cumulative_quantity), str(average_price), client_order_id))
+
+    def get_recorded_fill_total(self, client_order_id: str) -> Decimal:
+        rows = self.conn.execute(
+            "SELECT quantity FROM fills WHERE client_order_id = ?", (client_order_id,)
+        ).fetchall()
+        return sum((Decimal(row["quantity"]) for row in rows), Decimal("0"))
+
     def update_runtime_state(self, key: str, value: str):
         with self.conn:
             self.conn.execute("""
