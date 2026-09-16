@@ -33,6 +33,26 @@ def test_regime_classifier_neutral_slight_strong_breakout_shock():
     assert shock == MarketRegime.SHOCK
 
 
+def test_shock_cooldown_is_restart_safe_and_expires_after_calm_bars():
+    cfg = AdaptivePolicyConfig(
+        lookback=12,
+        shock_return_bps=D("75"),
+        shock_cooldown_bars=3,
+        strong_trend_bps=D("1000"),
+        breakout_bps=D("1000"),
+    )
+    # 100 -> 101 is a shock. Two calm returns afterwards still retain SHOCK.
+    retained, *_ = classify_regime(
+        [D("100"), D("101"), D("101.01"), D("101.02")], cfg)
+    assert retained == MarketRegime.SHOCK
+
+    # Once the shock return is outside the trailing three-return cooldown
+    # window, classification may return to normal without hidden state.
+    cleared, *_ = classify_regime(
+        [D("100"), D("101"), D("101.01"), D("101.02"), D("101.03")], cfg)
+    assert cleared != MarketRegime.SHOCK
+
+
 def test_adaptive_spacing_expands_with_volatility_and_is_bounded():
     cfg = AdaptivePolicyConfig(min_spacing_bps=D("4"), max_spacing_bps=D("20"))
     quiet = derive_adaptive_plan(
@@ -132,3 +152,5 @@ def test_invalid_adaptive_config_fails_closed():
         AdaptivePolicyConfig(
             slight_trend_bps=D("50"), strong_trend_bps=D("10")
         ).validate()
+    with pytest.raises(ValueError):
+        AdaptivePolicyConfig(lookback=5, shock_cooldown_bars=5).validate()
