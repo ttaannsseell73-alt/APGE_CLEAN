@@ -12,7 +12,7 @@ class MockAdapter:
     def submit_limit_order(self, **kwargs):
         return {"status": "NEW", "orderId": "ext_new", "clientOrderId": kwargs["client_order_id"]}
     def cancel_order(self, symbol, cid):
-        return {"status": "CANCELED", "orderId": "ext_cancel", "clientOrderId": cid}
+        return {"status": "CANCELED", "orderId": "ext_cancel", "clientOrderId": cid, "executedQty": "0"}
     def _map_order_state(self, status):
         mapping = {"NEW": 1, "CANCELED": 4} # Mocked Enum
         return mapping.get(status)

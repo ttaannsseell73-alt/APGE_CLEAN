@@ -74,7 +74,7 @@ def main():
 
     # Initialize components
     runtime = TestnetRuntime(adapter)
-    risk_engine = RiskEngine(position_limit=Decimal("5.0"))
+    risk_engine = RiskEngine(position_limit=Decimal("5.0"), require_explicit_side=True)
     risk_engine.system_state = SystemState.RECONCILING
     execution_engine = ExecutionEngine(db, adapter, risk_engine)
     reconciler = Reconciler(db, adapter)
@@ -147,7 +147,7 @@ def main():
                 return {"status": "NEW", "orderId": f"mock_{kwargs['client_order_id']}"}
             def cancel_order(self, symbol, cid):
                 logger.info(f"DRY RUN: Would cancel {cid}")
-                return {"status": "CANCELED", "orderId": f"mock_{cid}"}
+                return {"status": "CANCELED", "orderId": f"mock_{cid}", "executedQty": "0"}
             def _map_order_state(self, status):
                 mapping = {"NEW": OrderState.OPEN, "CANCELED": OrderState.CANCELED}
                 return mapping.get(status, OrderState.UNKNOWN)

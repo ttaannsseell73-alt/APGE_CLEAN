@@ -366,14 +366,20 @@ class TestnetRuntime:
         to_create = desired_set - current_set
         to_cancel_keys = current_set - desired_set
 
-        # 4. Execute Cancellations
-        for key in to_cancel_keys:
-            cids = order_map[key]
+        # 4. Execute Cancellations deterministically.
+        for key in sorted(to_cancel_keys, key=lambda x: (x[0], x[1], x[2])):
+            cids = sorted(order_map[key])
             for cid in cids:
                 execution_engine.cancel_order(self.symbol, cid)
 
-        # 5. Execute Creations
-        for side, price, qty in to_create:
+        # If any cancel outcome was uncertain, fail closed before creating
+        # replacement exposure in the same cycle.
+        if execution_engine.risk_engine.system_state != SystemState.OPERATIONAL:
+            logger.warning("Grid cycle stopped after cancellation uncertainty; reconciliation required.")
+            return
+
+        # 5. Execute Creations deterministically.
+        for side, price, qty in sorted(to_create, key=lambda x: (x[0], x[1], x[2])):
             proposal = next((p for p in proposals if p.side == side and p.price == price and p.quantity == qty), None)
             if proposal:
                 execution_engine.execute_proposal(self.symbol, proposal)

@@ -21,6 +21,18 @@ class ExecutionEngine:
         self.adapter = adapter
         self.risk_engine = risk_engine
 
+    @staticmethod
+    def _authoritative_filled_qty(value: Any) -> Optional[Decimal]:
+        if value is None:
+            return None
+        try:
+            qty = Decimal(str(value))
+        except Exception:
+            return None
+        if qty.is_nan() or qty.is_infinite() or qty < Decimal("0"):
+            return None
+        return qty
+
     def _generate_client_order_id(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> str:
         # Make deterministic based on intent and the number of PRIOR terminal orders matching this intent.
         # This prevents duplicate orders on retry (because the active order count wouldn't change if the previous failed to submit),
@@ -118,9 +130,7 @@ class ExecutionEngine:
         return None
 
     def cancel_order(self, symbol: str, client_order_id: str) -> bool:
-        """
-        Attempts to cancel an order. Returns True if cancellation was requested.
-        """
+        """Request cancel without releasing risk until fill total is authoritative."""
         intent = self.persistence.get_intent(client_order_id)
         if not intent:
             return False
@@ -128,14 +138,37 @@ class ExecutionEngine:
         if intent["status"] in ("FILLED", "CANCELED", "REJECTED"):
             return False
 
-        response = self.adapter.cancel_order(symbol, client_order_id)
+        # A cancel request never releases risk by itself.
+        self.risk_engine.request_cancel(client_order_id)
+
+        try:
+            response = self.adapter.cancel_order(symbol, client_order_id)
+        except Exception:
+            # Network/error ambiguity is a reconciliation event.
+            self.risk_engine.restore_connection()
+            raise
+
         raw_status = response.get("status", "UNKNOWN")
 
-        if "orderId" in response:
-            mapped_state = self.adapter._map_order_state(raw_status)
-            self.persistence.update_intent_status(client_order_id, mapped_state, str(response["orderId"]), raw_status=raw_status)
+        if "orderId" not in response:
+            self.risk_engine.restore_connection()
+            return False
+
+        mapped_state = self.adapter._map_order_state(raw_status)
+        self.persistence.update_intent_status(
+            client_order_id, mapped_state, str(response["orderId"]), raw_status=raw_status)
+
+        if mapped_state == OrderState.CANCELED:
+            final_filled = self._authoritative_filled_qty(response.get("executedQty"))
+            if final_filled is None:
+                # Never guess zero. Keep reservation and reconcile.
+                self.risk_engine.restore_connection()
+            else:
+                self.risk_engine.on_cancel_confirmed(client_order_id, final_filled)
             return True
 
+        # Any non-CANCELED cancel acknowledgement is uncertain.
+        self.risk_engine.restore_connection()
         return False
 
     def handle_order_update(self, update: Dict[str, Any]):
@@ -173,6 +206,16 @@ class ExecutionEngine:
                         logger.info(f"Applied fill {filled_qty} @ {filled_price} for {cid}")
                         # Tell risk engine to release risk for this fill amount
                         self.risk_engine.on_fill(order_id=cid, fill_id=str(trade_id), amount=filled_qty)
+
+        # A CANCELED websocket update is authoritative only when its
+        # cumulative filled quantity is present and valid.
+        if mapped_state == OrderState.CANCELED:
+            final_filled = self._authoritative_filled_qty(
+                update.get("accumulated_filled_qty"))
+            if final_filled is None:
+                self.risk_engine.restore_connection()
+            else:
+                self.risk_engine.on_cancel_confirmed(cid, final_filled)
 
         # Regardless of fill, update the final order state
         # But handle race condition: if it was already FILLED locally, a delayed CANCELED shouldn't overwrite it

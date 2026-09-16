@@ -93,9 +93,11 @@ class _ApprovalRecord:
 class Order:
     """Local record of an order submitted to the exchange."""
 
-    def __init__(self, order_id: str, amount: Decimal):
+    def __init__(self, order_id: str, amount: Decimal, *, symbol: str = "", side: str = ""):
         self.order_id = order_id
         self.initial_amount = amount
+        self.symbol = symbol
+        self.side = str(side).upper()
         self.filled_amount = Decimal('0')         # sum of individually seen fills
         self.cancel_confirmed_total: Optional[Decimal] = None
         self.state = OrderState.UNKNOWN
@@ -125,10 +127,11 @@ class RiskEngine:
       risk-increasing approvals are denied.
     """
 
-    def __init__(self, position_limit: Decimal):
+    def __init__(self, position_limit: Decimal, *, require_explicit_side: bool = False):
         self._lock = threading.RLock()
 
         self.position_limit = position_limit
+        self.require_explicit_side = require_explicit_side
         self.current_position = Decimal('0')
         self.reservations = Decimal('0')
         self.system_state = SystemState.OPERATIONAL
@@ -206,6 +209,28 @@ class RiskEngine:
             return False
         return val >= Decimal('0')
 
+    @staticmethod
+    def _normalize_side(side: str) -> str:
+        return str(side or "").upper()
+
+    def _position_delta(self, order: Order, amount: Decimal) -> Decimal:
+        """Translate an absolute fill delta into signed inventory movement.
+
+        Production runtimes require explicit BUY/SELL side. Legacy simulator
+        tests may omit side; in that compatibility mode only, the historical
+        positive-position behavior is retained. Explicit invalid sides are
+        rejected before an Order can be created.
+        """
+        if order.side == "BUY":
+            return amount
+        if order.side == "SELL":
+            return -amount
+        if self.require_explicit_side:
+            self.unresolved_conflicts.add(order.order_id)
+            self._enter_reconciling()
+            return Decimal('0')
+        return amount
+
     # -- Approval lifecycle --------------------------------------------------
 
     def request_approval(self, amount: Decimal, ttl_seconds: float = 5.0,
@@ -220,6 +245,13 @@ class RiskEngine:
         - insufficient capacity
         """
         with self._lock:
+            normalized_side = self._normalize_side(side)
+            if normalized_side and normalized_side not in ("BUY", "SELL"):
+                return None
+            if self.require_explicit_side and normalized_side not in ("BUY", "SELL"):
+                return None
+            side = normalized_side
+
             if self.system_state != SystemState.OPERATIONAL:
                 return None
 
@@ -323,6 +355,13 @@ class RiskEngine:
             if approval.status != ApprovalStatus.VALID:
                 return False
 
+            if record.side and record.side not in ("BUY", "SELL"):
+                return self._reject_approval(
+                    approval, record, ApprovalStatus.REJECTED)
+            if self.require_explicit_side and record.side not in ("BUY", "SELL"):
+                return self._reject_approval(
+                    approval, record, ApprovalStatus.REJECTED)
+
             # --- TTL check (from record, not the mutable object) ---
             if self.get_time() > record.expires_at:
                 return self._reject_approval(
@@ -356,7 +395,8 @@ class RiskEngine:
 
             # Reservation transitions from "Approval" to "Order".
             # Use record.amount (the original), not approval.amount.
-            self.orders[order_id] = Order(order_id, record.amount)
+            self.orders[order_id] = Order(
+                order_id, record.amount, symbol=record.symbol, side=record.side)
             return True
 
     # -- Fill handling -------------------------------------------------------
@@ -416,7 +456,7 @@ class RiskEngine:
             order.filled_amount += amount
             order.seen_fills_sum += amount
             order.seen_fill_ids.append(fill_id)
-            self.current_position += amount
+            self.current_position += self._position_delta(order, amount)
             self.reservations -= amount
             self.processed_fills.add(fill_id)
 
@@ -482,7 +522,7 @@ class RiskEngine:
             diff = final_filled_amount - order.filled_amount
             if diff > 0:
                 order.filled_amount += diff
-                self.current_position += diff
+                self.current_position += self._position_delta(order, diff)
                 self.reservations -= diff
 
             # Release the un-filled remainder
@@ -569,7 +609,7 @@ class RiskEngine:
                 diff = final_filled - order.filled_amount
                 if diff > 0:
                     order.filled_amount += diff
-                    self.current_position += diff
+                    self.current_position += self._position_delta(order, diff)
                     self.reservations -= diff
                 order.state = OrderState.FILLED
             elif final_state == OrderState.CANCELED:
@@ -578,7 +618,7 @@ class RiskEngine:
                 diff = final_filled - order.filled_amount
                 if diff > 0:
                     order.filled_amount += diff
-                    self.current_position += diff
+                    self.current_position += self._position_delta(order, diff)
                     self.reservations -= diff
                 remaining = order.initial_amount - order.filled_amount
                 if remaining > 0:
@@ -617,7 +657,7 @@ class RiskEngine:
             # Apply the resolution
             diff = final_filled - order.filled_amount
             order.filled_amount += diff
-            self.current_position += diff
+            self.current_position += self._position_delta(order, diff)
             
             # The order is now definitively resolved and considered CANCELED,
             # so it holds 0 reservations. Release whatever it was holding before.
