@@ -24,6 +24,7 @@ class AdaptivePolicyConfig:
     strong_trend_bps: Decimal = Decimal("35")
     breakout_bps: Decimal = Decimal("20")
     shock_return_bps: Decimal = Decimal("75")
+    shock_cooldown_bars: int = 6
     min_spacing_bps: Decimal = Decimal("4")
     max_spacing_bps: Decimal = Decimal("60")
     spread_multiplier: Decimal = Decimal("1.50")
@@ -38,6 +39,10 @@ class AdaptivePolicyConfig:
     def validate(self) -> None:
         if self.lookback < 2:
             raise ValueError("lookback must be >= 2")
+        if self.shock_cooldown_bars < 1:
+            raise ValueError("shock_cooldown_bars must be >= 1")
+        if self.shock_cooldown_bars >= self.lookback:
+            raise ValueError("shock_cooldown_bars must be < lookback")
         non_negative = (
             self.slight_trend_bps,
             self.strong_trend_bps,
@@ -106,7 +111,12 @@ def classify_regime(
     prices: Sequence[Decimal],
     config: AdaptivePolicyConfig,
 ) -> tuple[MarketRegime, Decimal, Decimal, Decimal]:
-    """Return regime, trend_bps, mean-absolute realized vol bps, last return bps."""
+    """Return regime, trend_bps, mean-absolute realized vol bps, last return bps.
+
+    Shock detection is deliberately restart-safe: a shock remains active while
+    any return inside the configured trailing cooldown window exceeds the shock
+    threshold. No hidden in-memory timer is required.
+    """
 
     config.validate()
     if len(prices) < 2:
@@ -121,7 +131,8 @@ def classify_regime(
     realized_vol_bps = _mean_abs(returns)
     last_return_bps = returns[-1]
 
-    if abs(last_return_bps) >= config.shock_return_bps:
+    shock_window = returns[-config.shock_cooldown_bars :]
+    if any(abs(value) >= config.shock_return_bps for value in shock_window):
         return MarketRegime.SHOCK, trend_bps, realized_vol_bps, last_return_bps
 
     if len(window) >= 3:
@@ -157,7 +168,7 @@ def derive_adaptive_plan(
 
     Trend changes the inventory target rather than directly opening a directional
     position. Strong trend/breakout/shock regimes target zero inventory and rely
-    on the core grid strategy's reduce-only behavior.
+    on the core grid strategy's risk-reducing behavior.
     """
 
     cfg = config or AdaptivePolicyConfig()
@@ -190,7 +201,6 @@ def derive_adaptive_plan(
         trend_target = -max_inventory * cfg.trend_bias_fraction
         size_multiplier = cfg.slight_trend_size_multiplier
     elif regime in (MarketRegime.STRONG_TREND, MarketRegime.BREAKOUT, MarketRegime.SHOCK):
-        # Defensive regimes do not carry a trend inventory target.
         trend_target = ZERO
         size_multiplier = cfg.defensive_size_multiplier
 
@@ -201,7 +211,6 @@ def derive_adaptive_plan(
             Decimal("-1"),
             Decimal("1"),
         )
-        # Positive funding penalizes long inventory; negative funding penalizes short inventory.
         funding_target = -max_inventory * cfg.funding_bias_fraction * normalized_funding
 
     target_limit = max_inventory * cfg.max_target_fraction
