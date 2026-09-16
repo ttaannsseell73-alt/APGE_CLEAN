@@ -17,7 +17,7 @@
 - Server time: synchronized offset propagated to signed Binance requests.
 - Deterministic reprice stress: 100 cycles covered.
 - Offline regression gate: 118 collected / 118 passed / 0 failed.
-- Pytest collection noise: suppressed through `pytest.ini`; no production behavior is changed by that suppression.
+- Pytest collection noise: fixed in `tests/conftest.py` by marking the imported production `TestnetRuntime` class as non-test; warnings are not globally suppressed.
 - Temporary APGE-03 code-generation scripts/workflows and scratch notes were removed from the branch; the persistent CI gate is `.github/workflows/apge-offline.yml`.
 
 ## Binance connectivity status
