@@ -4,13 +4,9 @@
 
 `0c94e8a75e09a8cec0a57179c154f057f83cce04`
 
-## Current implementation branch
+## Implementation branch
 
 `apge-03-controlled-grid-validation`
-
-Current offline head at report creation:
-
-`13439dab035c5a4f165eab3f9c36ea124b434fbe`
 
 ## Offline validation status
 
@@ -19,16 +15,36 @@ Current offline head at report creation:
 - Grid lifecycle: deterministic diffing, cancel-before-create behavior, duplicate-CID protection, signed inventory behavior, repeated reprice reservation invariants.
 - Reconciliation: exchange/persistence/risk rebuild hardening and signed exposure checks.
 - Server time: synchronized offset propagated to signed Binance requests.
-- Offline regression gate: GitHub Actions `APGE Offline Gate` PASS on branch head.
-- Test count: 118 collected / 118 passed / 0 failed.
-- Pytest collection warning suppression: applied on `TestnetRuntime` via `__test__ = False`.
+- Deterministic reprice stress: 100 cycles covered.
+- Offline regression gate: 118 collected / 118 passed / 0 failed.
+- Pytest collection noise: suppressed through `pytest.ini`; no production behavior is changed by that suppression.
+- Temporary APGE-03 code-generation scripts/workflows and scratch notes were removed from the branch; the persistent CI gate is `.github/workflows/apge-offline.yml`.
 
-## Testnet gate
+## Binance connectivity status
 
-**NOT YET CLAIMED AS PASS.**
+The connected Binance integration available to this workspace exposes public/read-only market-data operations. It does not expose authenticated Binance Futures TESTNET order placement, cancellation, account-position, or open-order mutation endpoints.
 
-The remaining APGE-03 gate requires authenticated Binance Futures TESTNET access for exactly one controlled 1-level grid validation (maximum one BUY + one SELL), duplicate-cycle verification, APGE-only cleanup, and final exchange/local/risk reconciliation.
+Therefore the authenticated controlled TESTNET grid gate cannot be truthfully executed from this workspace without a TESTNET-capable execution environment.
+
+## Remaining TESTNET gate
+
+**NOT CLAIMED AS PASS.**
+
+Required proof remains exactly one controlled 1-level Binance Futures TESTNET grid validation:
+
+- maximum one BUY + one SELL
+- LIMIT GTC only
+- duplicate-cycle verification with zero duplicate submissions
+- cancel only APGE-created orders
+- authoritative cancel/fill processing
+- final exchange/local/risk reconciliation
+- final APGE exchange open orders = 0
+- final local active intents = 0
+- final reservations = 0
+- system state = OPERATIONAL
 
 No real-money endpoint is authorized for APGE-03.
 
-Until that authenticated TESTNET proof exists, APGE-03 remains **OFFLINE VALIDATED / TESTNET PENDING** and must not be labeled `CONTROLLED TESTNET GRID VALIDATED`.
+Until authenticated TESTNET proof exists, the truthful project state is:
+
+`APGE-03 OFFLINE VALIDATED / AUTHENTICATED TESTNET GATE PENDING`
