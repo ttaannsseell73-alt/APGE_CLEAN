@@ -11,20 +11,16 @@ from apge.simulator import SystemState
 
 logger = logging.getLogger(__name__)
 
+
 class TestnetWebsocketTransport:
-    """
-    Real TESTNET WebSocket runtime handling reconnects and dispatching events.
-    """
+    """TESTNET WebSocket transport with fail-closed reconnect signaling."""
+
     def __init__(self, ws_url: str, runtime: 'TestnetRuntime', listen_key: str = ""):
         self.ws_url = ws_url
         self.runtime = runtime
         self.listen_key = listen_key
         self._running = False
         self._thread = None
-
-        # In a real environment, we'd use websocket-client or websockets.
-        # But to avoid adding dependencies, and since we just need the runtime structure,
-        # we provide the real reconnect loop structure. Tests will mock the actual socket read.
 
     def start(self):
         self._running = True
@@ -37,71 +33,58 @@ class TestnetWebsocketTransport:
             self._thread.join(timeout=1.0)
 
     def _run_loop(self):
-        """
-        Main websocket loop handling reconnects safely.
-        """
-        import socket
         try:
             import websocket
-            HAS_WS = True
+            has_ws = True
         except ImportError:
-            HAS_WS = False
+            has_ws = False
 
         while self._running:
-            if not HAS_WS:
-                logger.warning("websocket-client not installed. Mocking WS connection loop.")
+            if not has_ws:
+                logger.warning("websocket-client not installed; event loop cannot connect.")
+                self.runtime.handle_connection_loss()
                 time.sleep(1)
                 continue
-
             try:
                 ws = websocket.WebSocketApp(
                     self.ws_url,
                     on_message=self._on_message,
                     on_error=self._on_error,
-                    on_close=self._on_close
+                    on_close=self._on_close,
                 )
-                logger.info(f"Connecting to WS: {self.ws_url}")
+                logger.info("Connecting to WS: %s", self.ws_url)
                 ws.run_forever(ping_interval=60, ping_timeout=10)
+            except Exception as exc:
+                logger.error("WebSocket error: %s", exc)
 
-            except Exception as e:
-                logger.error(f"WebSocket error: {e}")
-
-            # If we exited run_forever, the socket closed.
             if self._running:
-                logger.warning("WebSocket closed unexpectedly. Triggering connection loss.")
                 self.runtime.handle_connection_loss()
-                time.sleep(1) # Backoff
-                logger.info("Attempting WebSocket reconnect...")
-
-                # Reconnect successful, we must trigger reconciliation
-                # Wait for the next loop iteration to actually connect,
-                # but we will signal the runtime to reconcile once connected.
-                self.runtime.handle_reconnect()
+                time.sleep(1)
+                # Merely leaving run_forever does not prove a successful
+                # reconnect. Reconciliation is triggered by the owner only
+                # after connectivity has actually been re-established.
 
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
-            if "e" in data:
-                event_type = data["e"]
-                if event_type == "bookTicker":
-                    self.runtime.handle_book_ticker(data)
-                elif event_type in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"):
-                    self.runtime.handle_user_data_event(data, self.runtime.execution_engine)
-        except Exception as e:
-            logger.error(f"Error parsing WS message: {e}")
+            event_type = data.get("e")
+            if event_type == "bookTicker":
+                self.runtime.handle_book_ticker(data)
+            elif event_type in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"):
+                self.runtime.handle_user_data_event(data, self.runtime.execution_engine)
+        except Exception as exc:
+            logger.error("Error parsing WS message: %s", exc)
 
     def _on_error(self, ws, error):
-        logger.error(f"WS Error: {error}")
+        logger.error("WS Error: %s", error)
 
     def _on_close(self, ws, close_status_code, close_msg):
-        logger.info(f"WS Closed: {close_status_code} {close_msg}")
+        logger.info("WS Closed: %s %s", close_status_code, close_msg)
 
 
 class TestnetRuntime:
-    """
-    Exchange runtime around the accepted Binance adapter.
-    Handles TESTNET validation, server time sync, loading exchange limits/filters.
-    """
+    """Binance Futures TESTNET runtime around the accepted adapter."""
+
     __test__ = False
 
     def __init__(self, adapter: BinanceAdapter):
@@ -110,18 +93,13 @@ class TestnetRuntime:
         self.tick_size: Optional[Decimal] = None
         self.step_size: Optional[Decimal] = None
         self.filters: Dict[str, Any] = {}
-
-        # Market Data state
         self.best_bid: Optional[Decimal] = None
         self.best_ask: Optional[Decimal] = None
         self.bba_timestamp: int = 0
         self.bba_receive_timestamp: int = 0
         self.stale_data_threshold_ms: int = 5000
         self.is_connected: bool = False
-
-        # Dynamic Inventory State
         self.current_inventory: Decimal = Decimal("0.0")
-
         self.ws_transports: List[TestnetWebsocketTransport] = []
         self.execution_engine: Any = None
         self.reconciler: Any = None
@@ -133,258 +111,194 @@ class TestnetRuntime:
         self.symbol = symbol
 
     def sync_server_time(self) -> bool:
-        """
-        Synchronizes local clock with server time to determine offset.
-        Returns True if successful, False if network error.
-        """
         try:
-            local_time_before = int(time.time() * 1000)
-            server_response = self.adapter.get_server_time()
-            local_time_after = int(time.time() * 1000)
-
-            server_time = server_response["serverTime"]
-            latency = (local_time_after - local_time_before) // 2
-
-            self.server_time_offset = server_time - (local_time_before + latency)
-            # Propagate offset to adapter so signed requests use it
+            local_before = int(time.time() * 1000)
+            response = self.adapter.get_server_time()
+            local_after = int(time.time() * 1000)
+            server_time = response["serverTime"]
+            latency = (local_after - local_before) // 2
+            self.server_time_offset = server_time - (local_before + latency)
             self.adapter.server_time_offset = self.server_time_offset
-            logger.info(f"Server time synchronized. Offset: {self.server_time_offset}ms")
             return True
-        except Exception as e:
-            logger.error(f"Failed to sync server time: {e}")
+        except Exception as exc:
+            logger.error("Failed to sync server time: %s", exc)
             return False
 
     def load_exchange_info(self, symbol: str) -> bool:
-        """
-        Loads tick size, step size, and other filters for the symbol.
-        Returns True if successful, False if network error or symbol not found.
-        """
         try:
             exchange_info = self.adapter.get_exchange_info()
-
-            symbol_info = next((s for s in exchange_info.get("symbols", []) if s["symbol"] == symbol), None)
+            symbol_info = next(
+                (row for row in exchange_info.get("symbols", []) if row["symbol"] == symbol),
+                None,
+            )
             if not symbol_info:
-                logger.error(f"Symbol {symbol} not found in exchange info.")
                 return False
-
-            for f in symbol_info.get("filters", []):
-                if f["filterType"] == "PRICE_FILTER":
-                    self.tick_size = Decimal(f["tickSize"])
-                    self.filters["maxPrice"] = Decimal(f["maxPrice"])
-                    self.filters["minPrice"] = Decimal(f["minPrice"])
-                elif f["filterType"] == "LOT_SIZE":
-                    self.step_size = Decimal(f["stepSize"])
-                    self.filters["maxQty"] = Decimal(f["maxQty"])
-                    self.filters["minQty"] = Decimal(f["minQty"])
-                elif f["filterType"] == "MIN_NOTIONAL":
-                    self.filters["minNotional"] = Decimal(f["notional"])
-
-            if not self.tick_size or not self.step_size:
-                logger.error(f"Could not extract tickSize or stepSize for {symbol}.")
-                return False
-
-            logger.info(f"Loaded exchange info for {symbol}. TickSize: {self.tick_size}, StepSize: {self.step_size}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load exchange info: {e}")
+            for filt in symbol_info.get("filters", []):
+                kind = filt["filterType"]
+                if kind == "PRICE_FILTER":
+                    self.tick_size = Decimal(filt["tickSize"])
+                    self.filters["maxPrice"] = Decimal(filt["maxPrice"])
+                    self.filters["minPrice"] = Decimal(filt["minPrice"])
+                elif kind == "LOT_SIZE":
+                    self.step_size = Decimal(filt["stepSize"])
+                    self.filters["maxQty"] = Decimal(filt["maxQty"])
+                    self.filters["minQty"] = Decimal(filt["minQty"])
+                elif kind == "MIN_NOTIONAL":
+                    self.filters["minNotional"] = Decimal(filt["notional"])
+            return bool(self.tick_size and self.step_size)
+        except Exception as exc:
+            logger.error("Failed to load exchange info: %s", exc)
             return False
 
     def handle_book_ticker(self, event: Dict[str, Any]):
-        """
-        Processes a bookTicker event to update best bid/ask.
-        """
         self.is_connected = True
         self.bba_receive_timestamp = int(time.time() * 1000)
-
         parsed = self.adapter.parse_book_ticker(event)
-
         self.best_bid = parsed["bid_price"]
         self.best_ask = parsed["ask_price"]
-        self.bba_timestamp = self.bba_receive_timestamp # In Binance, bookTicker doesn't have an event timestamp E, just update_id u. We use receive time.
+        self.bba_timestamp = self.bba_receive_timestamp
 
     def is_stale_data(self) -> bool:
-        """
-        Checks if the market data is stale based on the threshold.
-        """
-        if not self.is_connected:
+        if not self.is_connected or self.best_bid is None or self.best_ask is None:
             return True
-
-        if self.best_bid is None or self.best_ask is None:
-            return True
-
-        current_time = int(time.time() * 1000)
-        return (current_time - self.bba_receive_timestamp) > self.stale_data_threshold_ms
+        return (
+            int(time.time() * 1000) - self.bba_receive_timestamp
+            > self.stale_data_threshold_ms
+        )
 
     def handle_connection_loss(self):
-        """
-        Marks connection as lost, forcing stale state.
-        """
         self.is_connected = False
-        logger.warning("Connection lost. Market data is now considered stale.")
         if self.execution_engine:
-            self.execution_engine.risk_engine.system_state = SystemState.CONNECTION_LOST
+            self.execution_engine.risk_engine.lose_connection()
 
     def handle_reconnect(self):
-        """
-        Called when the websocket transport successfully reconnects.
-        Must trigger reconciliation before returning to OPERATIONAL.
-        """
-        logger.info("Websocket reconnected. Triggering reconciliation.")
+        """Call only after transport connectivity is verifiably restored."""
         if self.execution_engine and self.reconciler:
-            self.execution_engine.risk_engine.system_state = SystemState.RECONCILING
+            self.execution_engine.risk_engine.restore_connection()
             success = self.reconciler.resolve_state(self.symbol)
             if success:
                 self.current_inventory = self.reconciler.last_position_amount
                 self.execution_engine.risk_engine.complete_reconciliation()
-                if self.execution_engine.risk_engine.system_state == SystemState.OPERATIONAL:
-                    logger.info("Reconciliation complete. Returning to OPERATIONAL.")
-                else:
-                    logger.error("Risk reconciliation did not reach OPERATIONAL. HALTING.")
+                if self.execution_engine.risk_engine.system_state != SystemState.OPERATIONAL:
                     self.execution_engine.risk_engine.system_state = SystemState.HALTED
             else:
-                logger.error("Reconciliation failed upon reconnect. HALTING.")
                 self.execution_engine.risk_engine.system_state = SystemState.HALTED
 
-    def sync_inventory(self):
-        """
-        Syncs inventory from REST API.
-        """
+    def sync_inventory(self) -> bool:
         try:
             positions = self.adapter.get_positions()
             pos = next((p for p in positions if p.get("symbol") == self.symbol), None)
-            if pos:
-                self.current_inventory = Decimal(str(pos.get("positionAmt", "0.0")))
-                logger.info(f"Inventory synced to {self.current_inventory}")
-        except Exception as e:
-            logger.error(f"Failed to sync inventory: {e}")
+            self.current_inventory = Decimal(
+                str(pos.get("positionAmt", "0.0")) if pos else "0.0"
+            )
+            return True
+        except Exception as exc:
+            logger.error("Failed to sync inventory: %s", exc)
+            return False
 
     def start_event_loops(self, listen_key: str):
-        """
-        Starts the underlying websocket transports for Market Data and User Data.
-        """
+        if not listen_key:
+            raise ValueError("listen_key is required; dummy user-data streams are forbidden")
         ws_domain = self.adapter.ws_url
-
-        # 1. Market Data Stream
-        market_stream = f"{ws_domain}/ws/{self.symbol.lower()}@bookTicker"
-        market_ws = TestnetWebsocketTransport(market_stream, self)
-        self.ws_transports.append(market_ws)
-
-        # 2. User Data Stream
-        user_stream = f"{ws_domain}/ws/{listen_key}"
-        user_ws = TestnetWebsocketTransport(user_stream, self, listen_key)
-        self.ws_transports.append(user_ws)
-
+        market_ws = TestnetWebsocketTransport(
+            f"{ws_domain}/ws/{self.symbol.lower()}@bookTicker", self)
+        user_ws = TestnetWebsocketTransport(
+            f"{ws_domain}/ws/{listen_key}", self, listen_key)
+        self.ws_transports.extend([market_ws, user_ws])
         for ws in self.ws_transports:
             ws.start()
 
     def handle_user_data_event(self, event: Dict[str, Any], execution_engine: Any):
-        """
-        Idempotently processes user data events (ACCOUNT_UPDATE, ORDER_TRADE_UPDATE).
-        """
         event_type = event.get("e")
-
         if event_type == "ACCOUNT_UPDATE":
             parsed = self.adapter.parse_account_update(event)
-            # Update real inventory cache dynamically
             for pos in parsed.get("positions", []):
                 if pos["symbol"] == self.symbol:
                     self.current_inventory = Decimal(str(pos["position_amount"]))
-                    logger.info(f"Account update: Inventory is now {self.current_inventory}")
-
         elif event_type == "ORDER_TRADE_UPDATE":
             parsed = self.adapter.parse_order_trade_update(event)
-            # Pass to execution engine to handle fill/cancel idempotency safely
             execution_engine.handle_order_update(parsed)
-            # Note: We rely on ACCOUNT_UPDATE to modify current_inventory for complete correctness,
-            # as Binance sends ACCOUNT_UPDATE simultaneously with ORDER_TRADE_UPDATE.
 
-        else:
-            logger.debug(f"Unhandled user data event type: {event_type}")
-
-    def run_grid_cycle(self,
-                       grid_spacing: Decimal, base_size: Decimal, level_count: int,
-                       max_inventory: Decimal, system_state: SystemState,
-                       market_regime: MarketRegime, execution_engine: Any):
-        """
-        Runs one cycle of grid evaluation.
-        Generates proposals, diffs against existing active orders, and executes necessary changes.
-        """
-        # If we have no market data, proposals will just return [] due to None values or state.
-        bb = self.best_bid or Decimal("0")
-        ba = self.best_ask or Decimal("0")
-
-        # 0. Enforce symbol filters
-        if not self.tick_size or not self.step_size or "minQty" not in self.filters or "minNotional" not in self.filters:
-            logger.warning("Cannot run grid cycle: missing required exchange filters. Failing closed.")
+    def run_grid_cycle(
+        self,
+        grid_spacing: Decimal,
+        base_size: Decimal,
+        level_count: int,
+        max_inventory: Decimal,
+        system_state: SystemState,
+        market_regime: MarketRegime,
+        execution_engine: Any,
+    ):
+        """Run one deterministic desired-vs-live grid cycle."""
+        actual_state = execution_engine.risk_engine.system_state
+        if system_state != actual_state:
+            logger.warning("Caller/system RiskEngine state mismatch; grid cycle blocked.")
             return
 
-        # 1. Generate desired grid
+        if (
+            not self.tick_size
+            or not self.step_size
+            or "minQty" not in self.filters
+            or "minNotional" not in self.filters
+        ):
+            return
+
+        bb = self.best_bid or Decimal("0")
+        ba = self.best_ask or Decimal("0")
         proposals = generate_grid_proposals(
             best_bid=bb,
             best_ask=ba,
-            current_inventory=self.current_inventory, # Dynamic state
+            current_inventory=self.current_inventory,
             grid_spacing=grid_spacing,
             base_size=base_size,
             level_count=level_count,
             max_inventory=max_inventory,
             tick_size=self.tick_size,
             step_size=self.step_size,
-            system_state=system_state,
+            system_state=actual_state,
             market_regime=market_regime,
-            is_stale_data=self.is_stale_data()
+            is_stale_data=self.is_stale_data(),
         )
 
-        # Enforce notional and qty limits natively before diffing
-        valid_proposals = []
-        for p in proposals:
-            if p.quantity < self.filters["minQty"]:
-                logger.debug(f"Proposal {p.side} rejected: {p.quantity} < minQty {self.filters['minQty']}")
+        valid = []
+        for proposal in proposals:
+            if proposal.quantity < self.filters["minQty"]:
                 continue
-            if "maxQty" in self.filters and p.quantity > self.filters["maxQty"]:
-                logger.debug(f"Proposal {p.side} rejected: {p.quantity} > maxQty {self.filters['maxQty']}")
+            if "maxQty" in self.filters and proposal.quantity > self.filters["maxQty"]:
                 continue
-            if p.price * p.quantity < self.filters["minNotional"]:
-                logger.debug(f"Proposal {p.side} rejected: notional {p.price * p.quantity} < minNotional {self.filters['minNotional']}")
+            if proposal.price * proposal.quantity < self.filters["minNotional"]:
                 continue
-            valid_proposals.append(p)
+            valid.append(proposal)
+        proposals = valid
 
-        proposals = valid_proposals
-
-        # 2. Get currently tracked active orders from persistence
-        active_intents = execution_engine.persistence.get_active_intents()
-        active_orders = [i for i in active_intents if i["symbol"] == self.symbol]
-
-        # 3. Diffing: minimal submit/cancel changes
-        desired_set = set()
-        for p in proposals:
-            desired_set.add((p.side, p.price, p.quantity))
-
-        current_set = set()
-        order_map = {}
+        active_orders = [
+            row
+            for row in execution_engine.persistence.get_active_intents()
+            if row["symbol"] == self.symbol
+        ]
+        desired = {
+            (p.side, p.price, p.quantity, bool(p.reduce_only)): p
+            for p in proposals
+        }
+        current: Dict[tuple, list[str]] = {}
         for intent in active_orders:
-            key_exact = (intent["side"], Decimal(intent["price"]), Decimal(intent["quantity"]))
-            current_set.add(key_exact)
-            if key_exact not in order_map:
-                order_map[key_exact] = []
-            order_map[key_exact].append(intent["client_order_id"])
+            key = (
+                intent["side"],
+                Decimal(intent["price"]),
+                Decimal(intent["quantity"]),
+                bool(int(intent.get("reduce_only", 0))),
+            )
+            current.setdefault(key, []).append(intent["client_order_id"])
 
-        to_create = desired_set - current_set
-        to_cancel_keys = current_set - desired_set
+        desired_set = set(desired)
+        current_set = set(current)
 
-        # 4. Execute Cancellations deterministically.
-        for key in sorted(to_cancel_keys, key=lambda x: (x[0], x[1], x[2])):
-            cids = sorted(order_map[key])
-            for cid in cids:
+        for key in sorted(current_set - desired_set, key=lambda x: (x[0], x[1], x[2], x[3])):
+            for cid in sorted(current[key]):
                 execution_engine.cancel_order(self.symbol, cid)
 
-        # If any cancel outcome was uncertain, fail closed before creating
-        # replacement exposure in the same cycle.
         if execution_engine.risk_engine.system_state != SystemState.OPERATIONAL:
-            logger.warning("Grid cycle stopped after cancellation uncertainty; reconciliation required.")
             return
 
-        # 5. Execute Creations deterministically.
-        for side, price, qty in sorted(to_create, key=lambda x: (x[0], x[1], x[2])):
-            proposal = next((p for p in proposals if p.side == side and p.price == price and p.quantity == qty), None)
-            if proposal:
-                execution_engine.execute_proposal(self.symbol, proposal)
+        for key in sorted(desired_set - current_set, key=lambda x: (x[0], x[1], x[2], x[3])):
+            execution_engine.execute_proposal(self.symbol, desired[key])
