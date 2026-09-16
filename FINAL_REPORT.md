@@ -13,7 +13,8 @@
 - **Symbol**: BTCUSDT
 - **Side**: BUY
 - **Quantity**: 0.001
-- **Fill price**: 75780.20
+- **Order Limit Price**: 75780.20 (The intended price at which the limit order was placed, designed to cross the order book slightly and fill immediately)
+- **Executed Average Fill Price**: 75779.60 (The actual price the trade executed at, as reported by Binance)
 - **Deterministic clientOrderId**: APGE_00d06ecec49121d8b922
 - **Exchange orderId**: 28587849391
 - **APGE intent/order identifier**: APGE_00d06ecec49121d8b922
