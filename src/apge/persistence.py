@@ -5,10 +5,10 @@ from decimal import Decimal
 
 from apge.simulator import OrderState
 
+
 class Persistence:
-    """
-    Deterministic SQLite-based persistence layer.
-    """
+    """Deterministic SQLite-based persistence layer."""
+
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
         self._local = threading.local()
@@ -36,6 +36,7 @@ class Persistence:
                     side TEXT NOT NULL,
                     quantity TEXT NOT NULL,
                     price TEXT NOT NULL,
+                    reduce_only INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL,
                     raw_exchange_status TEXT,
                     exchange_order_id TEXT,
@@ -45,6 +46,16 @@ class Persistence:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Forward-compatible migration for databases created before
+            # exchange-level reduce-only intent became part of the canonical
+            # order identity.
+            columns = {
+                row["name"] for row in self.conn.execute("PRAGMA table_info(intents)").fetchall()
+            }
+            if "reduce_only" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE intents ADD COLUMN reduce_only INTEGER NOT NULL DEFAULT 0")
+
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS fills (
                     fill_id TEXT PRIMARY KEY,
@@ -62,14 +73,41 @@ class Persistence:
                 )
             """)
 
-    def save_intent(self, client_order_id: str, symbol: str, side: str, quantity: Decimal, price: Decimal, status: OrderState):
+    def save_intent(
+        self,
+        client_order_id: str,
+        symbol: str,
+        side: str,
+        quantity: Decimal,
+        price: Decimal,
+        status: OrderState,
+        reduce_only: bool = False,
+    ):
         with self.conn:
             self.conn.execute("""
-                INSERT INTO intents (client_order_id, symbol, side, quantity, price, status, raw_exchange_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (client_order_id, symbol, side, str(quantity), str(price), status.name, "NEW"))
+                INSERT INTO intents (
+                    client_order_id, symbol, side, quantity, price,
+                    reduce_only, status, raw_exchange_status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                client_order_id,
+                symbol,
+                side,
+                str(quantity),
+                str(price),
+                1 if reduce_only else 0,
+                status.name,
+                "NEW",
+            ))
 
-    def update_intent_status(self, client_order_id: str, status: OrderState, exchange_order_id: Optional[str] = None, raw_status: Optional[str] = None):
+    def update_intent_status(
+        self,
+        client_order_id: str,
+        status: OrderState,
+        exchange_order_id: Optional[str] = None,
+        raw_status: Optional[str] = None,
+    ):
         with self.conn:
             if exchange_order_id and raw_status:
                 self.conn.execute("""
@@ -93,10 +131,10 @@ class Persistence:
                 """, (status.name, client_order_id))
 
     def get_intent(self, client_order_id: str) -> Optional[Dict[str, Any]]:
-        row = self.conn.execute("SELECT * FROM intents WHERE client_order_id = ?", (client_order_id,)).fetchone()
-        if row:
-            return dict(row)
-        return None
+        row = self.conn.execute(
+            "SELECT * FROM intents WHERE client_order_id = ?", (client_order_id,)
+        ).fetchone()
+        return dict(row) if row else None
 
     def get_active_intents(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute("""
@@ -117,7 +155,8 @@ class Persistence:
                     price.is_infinite() or price < 0):
                 return False
 
-            if self.conn.execute("SELECT 1 FROM fills WHERE fill_id = ?", (fill_id,)).fetchone():
+            if self.conn.execute(
+                    "SELECT 1 FROM fills WHERE fill_id = ?", (fill_id,)).fetchone():
                 return False
 
             intent_row = self.conn.execute(
@@ -146,7 +185,12 @@ class Persistence:
             """, (str(new_filled), str(new_avg_price), client_order_id))
             return True
 
-    def sync_filled_quantity(self, client_order_id: str, cumulative_quantity: Decimal, average_price: Optional[Decimal] = None):
+    def sync_filled_quantity(
+        self,
+        client_order_id: str,
+        cumulative_quantity: Decimal,
+        average_price: Optional[Decimal] = None,
+    ):
         """Persist an authoritative cumulative fill quantity without inventing a trade id."""
         with self.conn:
             if average_price is None:
@@ -179,7 +223,7 @@ class Persistence:
             """, (key, value))
 
     def get_runtime_state(self, key: str) -> Optional[str]:
-        row = self.conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
-        if row:
-            return row['value']
-        return None
+        row = self.conn.execute(
+            "SELECT value FROM runtime_state WHERE key = ?", (key,)
+        ).fetchone()
+        return row['value'] if row else None
