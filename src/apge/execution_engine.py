@@ -171,6 +171,8 @@ class ExecutionEngine:
                     )
                     if fill_applied:
                         logger.info(f"Applied fill {filled_qty} @ {filled_price} for {cid}")
+                        # Tell risk engine to release risk for this fill amount
+                        self.risk_engine.on_fill(order_id=cid, fill_id=str(trade_id), amount=filled_qty)
 
         # Regardless of fill, update the final order state
         # But handle race condition: if it was already FILLED locally, a delayed CANCELED shouldn't overwrite it
