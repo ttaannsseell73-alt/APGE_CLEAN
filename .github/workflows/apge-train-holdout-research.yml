@@ -1,0 +1,47 @@
+name: APGE Train Holdout Research
+
+on:
+  push:
+    branches:
+      - apge-prelive-completion-v1
+    paths:
+      - 'scripts/apge_train_holdout_research.py'
+      - 'src/apge/backtest.py'
+      - 'src/apge/binance_public_data.py'
+      - 'src/apge/adaptive_policy.py'
+      - 'src/apge/market_regime.py'
+      - 'src/apge/grid_strategy.py'
+      - '.github/workflows/apge-train-holdout-research.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime dependency
+        run: python -m pip install --upgrade pip requests
+
+      - name: Run train-holdout research
+        env:
+          PYTHONPATH: src
+        run: python scripts/apge_train_holdout_research.py
+
+      - name: Upload research evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apge-train-holdout-research
+          path: apge_train_holdout_research.json
+          if-no-files-found: error
