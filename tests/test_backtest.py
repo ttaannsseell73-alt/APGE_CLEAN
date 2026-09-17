@@ -82,6 +82,29 @@ def test_fees_never_improve_equity_for_identical_fill_path():
     assert with_fee.total_fees == with_fee.turnover * D("0.001")
 
 
+def test_slippage_is_explicit_adverse_cost_and_never_improves_same_fill_path():
+    candles = _range_candles()
+    clean = run_backtest(candles, config=_config(fee_rate=D("0"), slippage_bps=D("0")))
+    stressed = run_backtest(candles, config=_config(fee_rate=D("0"), slippage_bps=D("3")))
+
+    assert stressed.fill_count == clean.fill_count
+    assert stressed.total_slippage > 0
+    assert clean.total_slippage == 0
+    assert stressed.final_equity <= clean.final_equity
+
+
+def test_decision_latency_is_deterministic_and_uses_older_information_set():
+    candles = _range_candles()
+    zero = run_backtest(candles, config=_config(decision_latency_bars=0))
+    delayed_a = run_backtest(candles, config=_config(decision_latency_bars=2))
+    delayed_b = run_backtest(candles, config=_config(decision_latency_bars=2))
+
+    assert delayed_a == delayed_b
+    assert zero.bars_processed == 60
+    assert delayed_a.bars_processed == 58
+    assert delayed_a.equity_curve[0].bar_index == zero.equity_curve[0].bar_index + 2
+
+
 def test_strong_trend_from_flat_does_not_open_new_risk():
     result = run_backtest(_strong_uptrend(), config=_config())
     assert result.fill_count == 0
@@ -108,7 +131,7 @@ def test_fill_confirmation_never_increases_fill_count_on_same_bars():
     assert confirmed.fill_count <= touch.fill_count
 
 
-def test_invalid_fill_confirmation_fails_closed():
+def test_invalid_execution_assumptions_fail_closed():
     candles = _range_candles()
     for value in (D("-1"), D("10000"), D("Infinity")):
         try:
@@ -117,6 +140,21 @@ def test_invalid_fill_confirmation_fails_closed():
             pass
         else:
             raise AssertionError("invalid fill confirmation must fail closed")
+
+        try:
+            run_backtest(candles, config=_config(slippage_bps=value))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid slippage must fail closed")
+
+    for latency in (-1, D("1")):
+        try:
+            run_backtest(candles, config=_config(decision_latency_bars=latency))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid latency must fail closed")
 
 
 def test_backtest_rejects_malformed_inputs():
