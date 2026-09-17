@@ -1,187 +1,457 @@
 import argparse
+import json
+import logging
 import os
 import sys
 import time
-import logging
+from dataclasses import fields, replace
 from decimal import Decimal
 
-from apge.persistence import Persistence
+from apge.adaptive_controller import run_adaptive_grid_cycle
+from apge.adaptive_policy import AdaptivePolicyConfig
 from apge.binance_adapter import BinanceAdapter, Transport
-from apge.simulator import RiskEngine, SystemState, OrderState
+from apge.binance_public_data import parse_adaptive_market_snapshot
+from apge.config import RuntimeConfig
 from apge.execution_engine import ExecutionEngine
-from apge.testnet_runtime import TestnetRuntime
-from apge.grid_strategy import MarketRegime
+from apge.market_regime import Candle, RegimeConfig
+from apge.observability import AuditLogger, MetricsRegistry
+from apge.persistence import Persistence
 from apge.reconciliation import Reconciler
+from apge.recovery import RecoveryManager
+from apge.simulator import OrderState, RiskEngine, SystemState
+from apge.testnet_runtime import TestnetRuntime
 
-# Setup basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("bot_runner")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("apge.bot_runner")
+
 
 class RequestsTransport(Transport):
-    """Simple wrapper around requests to satisfy the Transport protocol."""
     def __init__(self):
         import requests
         self.session = requests.Session()
 
     def get(self, url, params=None, headers=None):
-        r = self.session.get(url, params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
+        response = self.session.get(url, params=params, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json()
 
     def post(self, url, data=None, headers=None):
-        r = self.session.post(url, data=data, headers=headers)
-        r.raise_for_status()
-        return r.json()
+        response = self.session.post(url, data=data, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json()
+
+    def put(self, url, data=None, headers=None):
+        response = self.session.put(url, data=data, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json() if response.content else {}
 
     def delete(self, url, params=None, headers=None):
-        r = self.session.delete(url, params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
+        response = self.session.delete(url, params=params, headers=headers, timeout=20)
+        response.raise_for_status()
+        return response.json() if response.content else {}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="APGE V1 TESTNET Bot Runner")
-    parser.add_argument("--dry-run", action="store_true", help="Run without sending orders (default).")
-    parser.add_argument("--testnet", action="store_true", help="Target testnet (always true implicitly, flag for compatibility).")
-    parser.add_argument("--allow-testnet-orders", action="store_true", help="Explicitly allow sending orders to TESTNET.")
-    parser.add_argument("--symbol", type=str, default="BTCUSDT", help="Symbol to trade.")
-    args = parser.parse_args()
+class DryRunMockAdapter:
+    """Order-only no-network adapter used by the default runner mode."""
 
-    dry_run = not args.allow_testnet_orders if args.allow_testnet_orders else True
+    def __init__(self):
+        self._next_order_id = 1
 
-    if args.allow_testnet_orders:
-        logger.warning("DANGER: TESTNET ORDERS ENABLED. The bot will send live testnet orders.")
-    else:
-        logger.info("Starting in DRY-RUN mode. No real orders will be sent.")
+    def submit_limit_order(self, **kwargs):
+        order_id = self._next_order_id
+        self._next_order_id += 1
+        return {
+            "status": "NEW",
+            "orderId": str(order_id),
+            "executedQty": "0",
+            "avgPrice": "0",
+        }
 
-    # Load credentials
-    api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
-    api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET", "")
+    def cancel_order(self, symbol, orig_client_order_id):
+        return {
+            "status": "CANCELED",
+            "orderId": f"dry-{orig_client_order_id}",
+            "executedQty": "0",
+            "avgPrice": "0",
+        }
 
-    if args.allow_testnet_orders and (not api_key or not api_secret):
-        logger.error("BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET must be set for live testnet orders.")
-        sys.exit(1)
+    @staticmethod
+    def _map_order_state(status):
+        mapping = {
+            "NEW": OrderState.OPEN,
+            "CANCELED": OrderState.CANCELED,
+            "FILLED": OrderState.FILLED,
+            "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
+        }
+        return mapping.get(status, OrderState.UNKNOWN)
 
-    db = Persistence("apge_testnet.db")
-    transport = RequestsTransport()
-    adapter = BinanceAdapter(
-        transport=transport,
-        http_url="https://testnet.binancefuture.com",
-        ws_url="wss://fstream.binancefuture.com",
-        api_key=api_key,
-        api_secret=api_secret
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="APGE deterministic V1 runner (DRY-RUN by default)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="DRY-RUN is already the default; cannot be combined with order mutation.")
+    parser.add_argument("--testnet", action="store_true", help="Compatibility flag; authenticated mutation still requires --allow-testnet-orders.")
+    mode.add_argument(
+        "--allow-testnet-orders",
+        action="store_true",
+        help="Explicitly permit LIMIT GTC order mutation on Binance Futures TESTNET only.",
+    )
+    parser.add_argument("--symbol", default=None, help="Override APGE_SYMBOL for this run.")
+    parser.add_argument("--cycles", type=int, default=None, help="Override APGE_MAX_CYCLES for this run.")
+    return parser.parse_args(argv)
+
+
+def _build_config(args) -> RuntimeConfig:
+    config = RuntimeConfig.from_env()
+    if args.symbol is not None:
+        config = replace(config, symbol=args.symbol)
+    if args.cycles is not None:
+        config = replace(config, max_cycles=args.cycles)
+    return config.validate()
+
+
+def _bind_runner_identity(db, mode, symbol):
+    """A synthetic dry database must never become TESTNET exchange state."""
+    identity = {"mode": mode, "symbol": symbol}
+    raw = db.get_runtime_state("runner_identity_v1")
+    if raw is not None:
+        try:
+            if json.loads(raw) != identity:
+                raise ValueError("use a separate database for each runner mode and symbol")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid persisted runner identity") from exc
+    if mode == "dry-run" and db.get_active_intents():
+        raise ValueError("dry-run cannot recover active persisted orders through its synthetic adapter")
+    db.update_runtime_state("runner_identity_v1", json.dumps(identity, sort_keys=True))
+
+
+def _policy_config(config):
+    return AdaptivePolicyConfig(**{field.name: getattr(config, field.name) for field in fields(AdaptivePolicyConfig)})
+
+
+def _apply_adaptive_cycle(config, runtime, execution, audit, metrics, *, candles, funding_rate, source, **timestamps):
+    # Account and trade events may arrive separately. The RiskEngine's reconciled
+    # position plus validated trade fills is the position used for reservations.
+    # Hold the same runtime lock used by user-data events across diff application.
+    with runtime.event_lock:
+        if runtime.ws_transports and (not all(runtime.stream_health.values()) or runtime.is_stale_data()):
+            runtime.handle_data_uncertainty()
+        if "premium_time_ms" in timestamps:
+            now_ms = int(time.time() * 1000) + runtime.server_time_offset
+            if not 0 <= now_ms - timestamps["premium_time_ms"] <= 5000:
+                runtime.handle_data_uncertainty()
+                audit.event("adaptive_inputs_expired", source=source)
+        runtime.current_inventory = execution.risk_engine.current_position
+        result = run_adaptive_grid_cycle(
+            runtime=runtime,
+            execution_engine=execution,
+            candles=candles,
+            funding_rate=funding_rate,
+            nominal_base_size=config.base_size,
+            level_count=config.level_count,
+            max_inventory=config.max_inventory,
+            regime_config=RegimeConfig(lookback=config.regime_lookback),
+            policy_config=_policy_config(config),
+        )
+        if result.decision is not None:
+            decision = result.decision
+            metrics.gauge("grid_spacing", decision.grid_spacing)
+            metrics.gauge("target_inventory", decision.target_inventory)
+            audit.event(
+                "adaptive_decision",
+                source=source,
+                regime=decision.regime.name,
+                grid_spacing=decision.grid_spacing,
+                base_size=decision.base_size,
+                target_inventory=decision.target_inventory,
+                risk_increasing_allowed=decision.risk_increasing_allowed,
+                funding_rate=funding_rate,
+                proposal_count=result.proposal_count,
+                created_client_ids=result.lifecycle.created_client_ids,
+                canceled_client_ids=result.lifecycle.canceled_client_ids,
+                blocked_reason=result.lifecycle.blocked_reason,
+                **timestamps,
+            )
+        metrics.increment("orders_created", Decimal(len(result.lifecycle.created_client_ids)))
+        metrics.increment("orders_canceled", Decimal(len(result.lifecycle.canceled_client_ids)))
+        if result.lifecycle.blocked:
+            metrics.increment("blocked_cycles")
+            audit.event("adaptive_cycle_blocked", source=source, reason=result.lifecycle.blocked_reason)
+        return result
+
+
+def _fetch_adaptive_snapshot(config, adapter):
+    rows = adapter.get_klines(config.symbol, config.adaptive_interval, config.regime_lookback + 1)
+    premium = adapter.get_premium_index(config.symbol)
+    return parse_adaptive_market_snapshot(
+        rows,
+        premium,
+        symbol=config.symbol,
+        interval=config.adaptive_interval,
+        lookback=config.regime_lookback,
+        as_of_ms=int(adapter.clock() * 1000) + int(adapter.server_time_offset),
     )
 
-    # Initialize components
+
+def _cancel_local_apge_orders(config, execution_engine) -> bool:
+    for intent in list(execution_engine.persistence.get_active_intents()):
+        cid = intent["client_order_id"]
+        if intent.get("symbol") != config.symbol or not cid.startswith("APGE_"):
+            continue
+        if execution_engine.risk_engine.system_state != SystemState.OPERATIONAL:
+            return False
+        if not execution_engine.cancel_order(config.symbol, cid):
+            return False
+    return not execution_engine.persistence.get_active_intents()
+
+
+def _run_dry(config, db, risk, execution, audit, metrics, recovery) -> int:
+    runtime = TestnetRuntime(execution.adapter)  # only uses the order mock in this path after setup below
+    # The dry runner does not perform network I/O. Provide validated deterministic
+    # exchange-like constraints and a high enough synthetic BBA for BTC minNotional.
+    runtime.symbol = config.symbol
+    runtime.execution_engine = execution
+    runtime.tick_size = Decimal("0.1")
+    runtime.step_size = Decimal("0.001")
+    runtime.filters = {
+        "minQty": Decimal("0.001"),
+        "maxQty": Decimal("100"),
+        "minNotional": Decimal("5"),
+    }
+    runtime.stream_health = {"market": True, "user": True}
+    runtime.is_connected = True
+    runtime.best_bid = Decimal("100000")
+    runtime.best_ask = Decimal("100001")
+    runtime.bba_receive_timestamp = int(time.time() * 1000)
+    candles = tuple(Candle(Decimal("100000"), Decimal("100010"), Decimal("99990"), Decimal("100000")) for _ in range(config.regime_lookback))
+
+    risk.system_state = SystemState.OPERATIONAL
+    recovery.save(system_state=risk.system_state, inventory=runtime.current_inventory, clean_shutdown=False)
+    audit.event("runner_started", mode="dry-run", symbol=config.symbol, source="SYNTHETIC_OFFLINE")
+
+    for cycle in range(config.max_cycles):
+        runtime.bba_receive_timestamp = int(time.time() * 1000)
+        result = _apply_adaptive_cycle(
+            config, runtime, execution, audit, metrics,
+            candles=candles, funding_rate=Decimal("0"), source="SYNTHETIC_OFFLINE",
+        )
+        metrics.increment("cycles")
+        metrics.gauge("inventory", risk.current_position)
+        recovery.save(
+            system_state=risk.system_state,
+            inventory=risk.current_position,
+            last_event_seq=cycle + 1,
+            clean_shutdown=False,
+        )
+        if result.lifecycle.blocked or risk.system_state != SystemState.OPERATIONAL:
+            audit.event("runner_fail_closed", mode="dry-run", state=risk.system_state.name)
+            return 2
+
+    if not _cancel_local_apge_orders(config, execution):
+        audit.event("cleanup_failed", mode="dry-run", state=risk.system_state.name)
+        return 2
+
+    recovery.save(
+        system_state=risk.system_state,
+        inventory=risk.current_position,
+        last_event_seq=config.max_cycles,
+        clean_shutdown=True,
+    )
+    audit.event("runner_stopped", mode="dry-run", metrics=metrics.snapshot())
+    return 0
+
+
+def _run_authenticated_testnet(config, db, adapter, risk, execution, audit, metrics, recovery) -> int:
     runtime = TestnetRuntime(adapter)
-    risk_engine = RiskEngine(position_limit=Decimal("5.0"), require_explicit_side=True)
-    risk_engine.system_state = SystemState.RECONCILING
-    execution_engine = ExecutionEngine(db, adapter, risk_engine)
-    reconciler = Reconciler(db, adapter, risk_engine)
-    runtime.attach_components(execution_engine, reconciler, args.symbol)
+    reconciler = Reconciler(db, adapter, risk)
+    runtime.attach_components(execution, reconciler, config.symbol)
+    risk.system_state = SystemState.RECONCILING
+    recovery.save(system_state=risk.system_state, inventory=Decimal("0"), clean_shutdown=False)
+    audit.event("runner_started", mode="authenticated-testnet", symbol=config.symbol)
 
-    if not dry_run:
-        # Start connectivity check
-        if not runtime.sync_server_time():
-            logger.error("Failed to sync server time. Halting.")
-            sys.exit(1)
+    if not runtime.sync_server_time() or not runtime.load_exchange_info(config.symbol):
+        risk.system_state = SystemState.HALTED
+        recovery.save(system_state=risk.system_state, inventory=risk.current_position, clean_shutdown=False)
+        audit.event("preflight_failed", stage="time_or_exchange_info")
+        return 2
+    if not reconciler.resolve_state(config.symbol):
+        risk.system_state = SystemState.HALTED
+        recovery.save(system_state=risk.system_state, inventory=risk.current_position, clean_shutdown=False)
+        audit.event("preflight_failed", stage="reconciliation")
+        return 2
 
-        if not runtime.load_exchange_info(args.symbol):
-            logger.error("Failed to load exchange info. Halting.")
-            sys.exit(1)
+    runtime.current_inventory = reconciler.last_position_amount
+    risk.complete_reconciliation()
+    if risk.system_state != SystemState.OPERATIONAL:
+        risk.system_state = SystemState.HALTED
+        recovery.save(system_state=risk.system_state, inventory=risk.current_position, clean_shutdown=False)
+        audit.event("preflight_failed", stage="risk_reconciliation")
+        return 2
 
-        # Reconcile on start
-        logger.info("Reconciling state...")
-        logger.info("Reconciling state...")
-        if not reconciler.resolve_state(args.symbol):
-            logger.error("Reconciliation failed (corrupt/unknown state). Halting.")
-            risk_engine.system_state = SystemState.HALTED
-            sys.exit(1)
+    listen_key = None
+    try:
+        listen_key = adapter.start_user_data_stream()
+        runtime.start_event_loops(listen_key)
+        last_keepalive = time.monotonic()
 
-        # Reconciler rebuilt RiskEngine from the same authoritative exchange snapshot.
-        runtime.current_inventory = reconciler.last_position_amount
-        risk_engine.complete_reconciliation()
-        if risk_engine.system_state != SystemState.OPERATIONAL:
-            logger.error("RiskEngine could not complete reconciliation. Halting.")
-            risk_engine.system_state = SystemState.HALTED
-            sys.exit(1)
-        logger.info("System is OPERATIONAL. Starting event loops.")
+        for cycle in range(config.max_cycles):
+            if time.monotonic() - last_keepalive >= 25 * 60:
+                adapter.keepalive_user_data_stream(listen_key)
+                last_keepalive = time.monotonic()
 
-        # Start event loops only after authoritative position/risk synchronization.
-        runtime.start_event_loops("dummy_listen_key")
+            # A REST BBA is only a bootstrap/fallback. Risk-increasing activity
+            # remains blocked until both websocket streams are healthy and fresh.
+            try:
+                book = adapter.transport.get(
+                    f"{adapter.http_url}/fapi/v1/ticker/bookTicker",
+                    params={"symbol": config.symbol},
+                )
+                runtime.handle_book_ticker({
+                    "s": config.symbol,
+                    "b": book["bidPrice"],
+                    "B": book["bidQty"],
+                    "a": book["askPrice"],
+                    "A": book["askQty"],
+                    "u": 1,
+                })
+            except Exception:
+                runtime.handle_data_uncertainty()
 
-        try:
-            for _ in range(5):
-                logger.info("Running grid cycle...")
-                # Fetch BBA via REST for the smoke loop since we mock WS
+            if risk.system_state == SystemState.RECONCILING and all(runtime.stream_health.values()) and not runtime.is_stale_data():
+                runtime.handle_reconnect()
+
+            if risk.system_state == SystemState.OPERATIONAL and all(runtime.stream_health.values()) and not runtime.is_stale_data():
                 try:
-                    book = adapter.transport.get(f"{adapter.http_url}/fapi/v1/ticker/bookTicker", params={"symbol": args.symbol})
-                    runtime.handle_book_ticker({"s": args.symbol, "b": book["bidPrice"], "B": book["bidQty"], "a": book["askPrice"], "A": book["askQty"], "u": 1})
-                except Exception as e:
-                    logger.warning(f"Failed to fetch market data: {e}")
-
-                runtime.run_grid_cycle(
-                    grid_spacing=Decimal("100"),
-                    base_size=Decimal("0.01"),
-                    level_count=3,
-                    max_inventory=Decimal("5.0"),
-                    system_state=risk_engine.system_state,
-                    market_regime=MarketRegime.NEUTRAL,
-                    execution_engine=execution_engine
+                    snapshot = _fetch_adaptive_snapshot(config, adapter)
+                except Exception as exc:
+                    runtime.handle_data_uncertainty()
+                    metrics.increment("blocked_cycles")
+                    audit.event("adaptive_inputs_invalid", reason=type(exc).__name__)
+                    return 2
+                _apply_adaptive_cycle(
+                    config, runtime, execution, audit, metrics,
+                    candles=snapshot.candles,
+                    funding_rate=snapshot.funding_rate,
+                    source="BINANCE_FUTURES_TESTNET",
+                    last_close_time_ms=snapshot.last_close_time_ms,
+                    premium_time_ms=snapshot.premium_time_ms,
                 )
-                time.sleep(2)
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
+            else:
+                metrics.increment("blocked_cycles")
+                audit.event("adaptive_cycle_waiting", state=risk.system_state.name)
+            metrics.increment("cycles")
+            metrics.gauge("inventory", risk.current_position)
+            recovery.save(
+                system_state=risk.system_state,
+                inventory=risk.current_position,
+                last_event_seq=cycle + 1,
+                clean_shutdown=False,
+            )
+            if risk.system_state == SystemState.HALTED:
+                audit.event("runner_fail_closed", mode="authenticated-testnet", state="HALTED")
+                return 2
+            time.sleep(float(config.cycle_interval_seconds))
 
-    else:
-        logger.info("Starting in DRY-RUN mode. Components initialized.")
-        risk_engine.system_state = SystemState.OPERATIONAL
+        # Controlled finite runner always exits flat in order-intent space. It
+        # cancels APGE-owned intents only; unrelated exchange orders are untouched.
+        with runtime.event_lock:
+            if risk.system_state != SystemState.OPERATIONAL or not _cancel_local_apge_orders(config, execution):
+                audit.event("cleanup_failed", mode="authenticated-testnet", state=risk.system_state.name)
+                return 2
+        # Stop event ingestion before the final authoritative snapshot so a late
+        # asynchronous event cannot invalidate a just-written clean checkpoint.
+        if not runtime.stop_event_loops():
+            risk.system_state = SystemState.HALTED
+            audit.event("cleanup_failed", mode="authenticated-testnet", stage="stream_shutdown")
+            return 2
+        if not reconciler.resolve_state(config.symbol):
+            risk.system_state = SystemState.HALTED
+            audit.event("cleanup_failed", mode="authenticated-testnet", stage="final_reconciliation")
+            return 2
+        runtime.current_inventory = reconciler.last_position_amount
+        risk.complete_reconciliation()
+        if risk.system_state != SystemState.OPERATIONAL:
+            return 2
 
-        # Mock some exchange filters and data to allow the dry-run loop to proceed
-        runtime.tick_size = Decimal("0.1")
-        runtime.step_size = Decimal("0.001")
-        runtime.filters = {"minQty": Decimal("0.001"), "minNotional": Decimal("5.0"), "maxQty": Decimal("100.0")}
-        runtime.handle_book_ticker({"s": args.symbol, "b": "100.0", "B": "1", "a": "101.0", "A": "1", "u": 1})
+        recovery.save(
+            system_state=risk.system_state,
+            inventory=risk.current_position,
+            last_event_seq=config.max_cycles,
+            clean_shutdown=True,
+        )
+        audit.event("runner_stopped", mode="authenticated-testnet", metrics=metrics.snapshot())
+        return 0
+    finally:
+        runtime.stop_event_loops()
+        if listen_key:
+            try:
+                adapter.close_user_data_stream(listen_key)
+            except Exception:
+                logger.warning("Failed to close TESTNET listenKey during shutdown")
+        checkpoint = recovery.load()
+        if checkpoint is not None and not checkpoint.clean_shutdown:
+            recovery.save(
+                system_state=risk.system_state,
+                inventory=risk.current_position,
+                last_event_seq=checkpoint.last_event_seq,
+                clean_shutdown=False,
+            )
 
-        class DryRunMockAdapter:
-            def submit_limit_order(self, **kwargs):
-                logger.info(f"DRY RUN: Would submit {kwargs['side']} {kwargs['quantity']} @ {kwargs['price']}")
-                return {"status": "NEW", "orderId": f"mock_{kwargs['client_order_id']}"}
-            def cancel_order(self, symbol, cid):
-                logger.info(f"DRY RUN: Would cancel {cid}")
-                return {"status": "CANCELED", "orderId": f"mock_{cid}", "executedQty": "0"}
-            def _map_order_state(self, status):
-                mapping = {"NEW": OrderState.OPEN, "CANCELED": OrderState.CANCELED}
-                return mapping.get(status, OrderState.UNKNOWN)
 
-        # Swap the adapter out for execution so it doesn't hit the network
-        execution_engine.adapter = DryRunMockAdapter()
+def main(argv=None):
+    args = _parse_args(argv)
+    try:
+        config = _build_config(args)
+    except ValueError as exc:
+        logger.error("Invalid APGE configuration: %s", exc)
+        return 2
 
-        try:
-            for _ in range(5):
-                logger.info("[DRY RUN] Running grid cycle...")
-                # Resolve UNKNOWNs to prevent UNKNOWN gate from blocking loop
-                for intent in db.get_active_intents():
-                    if execution_engine.risk_engine.orders.get(intent["client_order_id"]):
-                        if execution_engine.risk_engine.orders[intent["client_order_id"]].state == OrderState.UNKNOWN:
-                            execution_engine.risk_engine.resolve_order(intent["client_order_id"], OrderState.OPEN, Decimal("0"))
+    api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
+    api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET", "")
+    http_url = os.environ.get("BINANCE_TESTNET_HTTP_URL", "https://testnet.binancefuture.com")
+    ws_url = os.environ.get("BINANCE_TESTNET_WS_URL", "wss://fstream.binancefuture.com")
 
-                runtime.run_grid_cycle(
-                    grid_spacing=Decimal("1.0"),
-                    base_size=Decimal("0.1"),
-                    level_count=3,
-                    max_inventory=Decimal("5.0"),
-                    system_state=risk_engine.system_state,
-                    market_regime=MarketRegime.NEUTRAL,
-                    execution_engine=execution_engine
-                )
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
+    if args.allow_testnet_orders and (not api_key or not api_secret):
+        logger.error("Authenticated TESTNET mutation requires BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET")
+        return 2
 
-        logger.info("Dry run completed deterministic cycles.")
+    db = Persistence(config.db_path)
+    try:
+        _bind_runner_identity(db, "authenticated-testnet" if args.allow_testnet_orders else "dry-run", config.symbol)
+    except ValueError as exc:
+        logger.error("APGE database isolation rejected startup: %s", exc)
+        db.close()
+        return 2
+    audit = AuditLogger(db)
+    metrics = MetricsRegistry()
+    recovery = RecoveryManager(db)
+    risk = RiskEngine(position_limit=config.position_limit, require_explicit_side=True)
 
-    db.close()
+    try:
+        if args.allow_testnet_orders:
+            adapter = BinanceAdapter(
+                transport=RequestsTransport(),
+                http_url=http_url,
+                ws_url=ws_url,
+                api_key=api_key,
+                api_secret=api_secret,
+            )
+            execution = ExecutionEngine(db, adapter, risk)
+            return _run_authenticated_testnet(
+                config, db, adapter, risk, execution, audit, metrics, recovery
+            )
+
+        execution = ExecutionEngine(db, DryRunMockAdapter(), risk)
+        return _run_dry(config, db, risk, execution, audit, metrics, recovery)
+    except Exception as exc:
+        risk.restore_connection()
+        audit.event("runner_failed", reason=type(exc).__name__, state=risk.system_state.name)
+        recovery.save(system_state=risk.system_state, inventory=risk.current_position, clean_shutdown=False)
+        logger.error("APGE runner stopped safely: %s", type(exc).__name__)
+        return 2
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

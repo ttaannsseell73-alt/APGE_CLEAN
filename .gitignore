@@ -4,5 +4,13 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.db
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
 scratch/
 .agy/
+*.egg-info/
+build/
+dist/

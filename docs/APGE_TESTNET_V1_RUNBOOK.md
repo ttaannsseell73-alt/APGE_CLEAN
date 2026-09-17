@@ -44,15 +44,20 @@ PYTHONPATH=src python3 scripts/testnet_smoke.py --stage C
 ## 2. Bot Execution
 
 ### Dry Run Command
-The bot defaults to DRY RUN mode if no testnet order flag is specified. It will connect, reconcile, and compute grid cycles, but will not send orders.
+The bot defaults to an offline synthetic DRY RUN if no mutation flag is specified.
+It does not connect to Binance. It uses synthetic candles/book/filters with the
+real adaptive controller, persistence and risk/execution lifecycle, then cancels
+its local synthetic orders. Audit source: `SYNTHETIC_OFFLINE`.
 ```bash
 PYTHONPATH=src python3 -m apge.bot_runner
 ```
 
 ### Live Testnet Orders Command
 To allow the bot to place limit orders on the Testnet, you must explicitly pass the `--allow-testnet-orders` flag.
+Use a separate `APGE_DB_PATH` from your dry run; each database is bound to its
+runner mode and symbol. `--dry-run --allow-testnet-orders` is rejected.
 ```bash
-PYTHONPATH=src python3 -m apge.bot_runner --allow-testnet-orders
+APGE_DB_PATH=apge_testnet_state.sqlite3 PYTHONPATH=src python3 -m apge.bot_runner --allow-testnet-orders
 ```
 
 ## Expected Outputs
@@ -62,7 +67,21 @@ Upon successful startup in Live Mode, you should see logs similar to:
 2. `Loaded exchange info for BTCUSDT. TickSize: 0.1, StepSize: 0.001`
 3. `Reconciling state...`
 4. `System is OPERATIONAL. Starting grid loop.`
-5. The bot will then periodically evaluate the orderbook and apply diffs to keep the live limit orders aligned with the deterministic grid strategy.
+5. Once both WebSocket streams are healthy and the actual market stream is fresh,
+   the bot reads completed klines and a current funding snapshot, computes the
+   configured adaptive decision, and cancels obsolete orders before replacement.
+
+`APGE_GRID_SPACING` belongs to the static controlled validation path. The normal
+runner uses the adaptive variables in `.env.example`, including the configured
+interval, lookback, spacing bounds, volatility multiplier and inventory/funding
+caps. No `.env` file is automatically loaded.
+
+Malformed/stale/incomplete candle or funding input cannot submit new orders.
+An input failure exits 2 and preserves a dirty checkpoint and any unresolved
+exchange intents for subsequent reconciliation. REST book updates cannot mark a
+disconnected or silent market WebSocket healthy. Listen-key expiry blocks new
+risk. Shutdown requires stopping event ingestion and a final authoritative
+snapshot before a clean checkpoint is written.
 
 ## HALT Conditions
 

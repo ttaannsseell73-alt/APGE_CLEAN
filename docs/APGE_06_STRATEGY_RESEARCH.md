@@ -77,6 +77,31 @@ One-basis-point fill-confirmation stress on the same frozen holdout:
 
 ## Current conclusion
 
+### Fixed historical research on the repository completion branch
+
+Directly read from release workflow `35220917769` at
+`c9e2ccf2c720151ae918d58b6d6927c156e4fb30`:
+
+- training: 2026-04-01 through 2026-06-30, 13 weekly folds;
+- holdout: 2026-07-01 through 2026-07-21, three weekly folds;
+- selected on training only: 32 bps spacing / volatility multiplier 1.5;
+- selected training aggregate: -15.1260944366920, 7/13 positive folds;
+- every candidate's aggregate training PnL was negative in this run.
+
+| Frozen holdout scenario | Positive folds | Aggregate net PnL |
+| --- | ---: | ---: |
+| baseline | 1/3 | -1.70019780 |
+| 1 bp confirmation / 0.5 bp slippage / one-bar latency | 0/3 | -10.1279823715520 |
+| severe stress, non-gate diagnostic | 0/3 | -12.703130847480 |
+
+Result: `robustness_gate=NOT_PASSED`. The research program returned exit 0
+because reproducible execution completed, not because the strategy succeeded.
+The selected configuration is a diagnostic selection, not a deployment recommendation.
+These July holdouts are now observed and must be preserved as such.
+
+Evidence: [release workflow](https://github.com/ttaannsseell73-alt/APGE_CLEAN/actions/runs/35220917769),
+job `105200562396`, artifact `10496772528`.
+
 The execution/risk architecture remains structurally sound in the tested scope, but the current adaptive policy has **not demonstrated a robust positive expectancy**.
 
 Therefore:

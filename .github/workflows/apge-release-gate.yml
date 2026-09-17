@@ -1,0 +1,192 @@
+name: APGE Repository Release Gate
+
+on:
+  push:
+    branches:
+      - apge-repository-completion-v1
+      - release/apge-v1-rc1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  packaging:
+    name: release-wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build wheel and verify isolated installation
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          python -m venv "$RUNNER_TEMP/apge-wheel-venv"
+          "$RUNNER_TEMP/apge-wheel-venv/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/apge-wheel-venv/bin/apge-bot" --help >/dev/null
+          APGE_DB_PATH="$RUNNER_TEMP/wheel-smoke.sqlite3" APGE_MAX_CYCLES=2 "$RUNNER_TEMP/apge-wheel-venv/bin/apge-bot" --dry-run
+          "$RUNNER_TEMP/apge-wheel-venv/bin/python" - <<'PY'
+          import json
+          import os
+          import apge
+          from apge.persistence import Persistence
+          from apge.recovery import RecoveryManager
+          assert os.path.abspath(apge.__file__).startswith(os.environ["RUNNER_TEMP"] + "/apge-wheel-venv/")
+          db = Persistence(os.environ["RUNNER_TEMP"] + "/wheel-smoke.sqlite3")
+          try:
+              assert db.get_active_intents() == []
+              assert RecoveryManager(db).load().clean_shutdown is True
+              decisions = [json.loads(e["payload_json"]) for e in db.get_audit_events() if e["event_type"] == "adaptive_decision"]
+              assert len(decisions) == 2
+              assert all(e["source"] == "SYNTHETIC_OFFLINE" for e in decisions)
+              print("Isolated wheel adaptive smoke PASS")
+          finally:
+              db.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  offline:
+    name: release-offline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Clean install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest
+      - name: Verify package imports
+        run: python -c "import apge; import apge.backtest; import apge.execution_engine; import apge.reconciliation; import apge.paper_adapter; import apge.recovery; import apge.observability"
+      - name: Collect tests
+        run: python -m pytest --collect-only -q
+      - name: Run full deterministic suite
+        run: python -m pytest -q
+
+  security:
+    name: release-security
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Scan tracked files for credentials
+        run: python scripts/check_repository_secrets.py
+
+  fixed-robustness:
+    name: release-fixed-robustness
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run fixed historical robustness research
+        run: python scripts/apge_fixed_historical_robustness.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-fixed-historical-robustness
+          path: apge_fixed_historical_robustness.json
+          if-no-files-found: error
+
+  public-market:
+    name: release-public-market
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run read-only public market validation
+        run: python scripts/apge_public_market_validation.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-public-market-validation
+          path: apge_public_market_validation.json
+          if-no-files-found: error
+
+  walkforward:
+    name: release-walkforward
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run structural walk-forward validation
+        run: python scripts/apge_walkforward_validation.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-walkforward-validation
+          path: apge_walkforward_validation.json
+          if-no-files-found: error
+
+  stress-walkforward:
+    name: release-stress-walkforward
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run structural stress walk-forward
+        run: python scripts/apge_stress_walkforward.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-stress-walkforward
+          path: apge_stress_walkforward.json
+          if-no-files-found: error
+
+  train-holdout:
+    name: release-train-holdout
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Run train/holdout research execution
+        run: python scripts/apge_train_holdout_research.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-train-holdout-research
+          path: apge_train_holdout_research.json
+          if-no-files-found: error

@@ -61,6 +61,7 @@ def apply_grid_diff(symbol: str, proposals: Iterable[OrderProposal], execution_e
     to_create = sorted(desired_set - current_set, key=lambda item: (item[0], item[1], item[2]))
 
     canceled = []
+    decision_position = risk.current_position
     for key in to_cancel:
         cid = order_map[key][0]
         try:
@@ -74,6 +75,12 @@ def apply_grid_diff(symbol: str, proposals: Iterable[OrderProposal], execution_e
         canceled.append(cid)
         if risk.system_state != SystemState.OPERATIONAL:
             return GridLifecycleResult((), tuple(canceled), "cancel outcome requires reconciliation")
+
+    if risk.current_position != decision_position:
+        # An authoritative cancel can reveal a fill. The original inventory
+        # target and risk-reducing quantities were computed before that fill.
+        risk.restore_connection()
+        return GridLifecycleResult((), tuple(canceled), "inventory changed during cancellation; recompute after reconciliation")
 
     proposal_by_key = {(p.side, p.price, p.quantity): p for p in desired}
     created = []

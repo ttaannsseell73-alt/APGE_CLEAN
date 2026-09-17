@@ -5,10 +5,10 @@ from decimal import Decimal
 
 from apge.simulator import OrderState
 
+
 class Persistence:
-    """
-    Deterministic SQLite-based persistence layer.
-    """
+    """Deterministic SQLite-based persistence and audit layer."""
+
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
         self._local = threading.local()
@@ -16,16 +16,16 @@ class Persistence:
 
     @property
     def conn(self) -> sqlite3.Connection:
-        if not hasattr(self._local, 'conn'):
+        if not hasattr(self._local, "conn"):
             self._local.conn = sqlite3.connect(self.db_path)
             self._local.conn.execute("PRAGMA foreign_keys = ON")
             self._local.conn.row_factory = sqlite3.Row
         return self._local.conn
 
     def close(self):
-        if hasattr(self._local, 'conn'):
+        if hasattr(self._local, "conn"):
             self._local.conn.close()
-            delattr(self._local, 'conn')
+            delattr(self._local, "conn")
 
     def _init_db(self):
         with self.conn:
@@ -59,6 +59,14 @@ class Persistence:
                 CREATE TABLE IF NOT EXISTS runtime_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                )
+            """)
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
@@ -126,9 +134,9 @@ class Persistence:
             if not intent_row:
                 return False
 
-            order_qty = Decimal(intent_row['quantity'])
-            old_filled = Decimal(intent_row['filled_quantity'])
-            old_avg_price = Decimal(intent_row['average_price'])
+            order_qty = Decimal(intent_row["quantity"])
+            old_filled = Decimal(intent_row["filled_quantity"])
+            old_avg_price = Decimal(intent_row["average_price"])
             new_filled = old_filled + quantity
             if new_filled > order_qty:
                 return False
@@ -139,7 +147,7 @@ class Persistence:
             """, (fill_id, client_order_id, str(quantity), str(price)))
 
             total_value = (old_avg_price * old_filled) + (price * quantity)
-            new_avg_price = total_value / new_filled if new_filled > 0 else Decimal('0')
+            new_avg_price = total_value / new_filled if new_filled > 0 else Decimal("0")
             self.conn.execute("""
                 UPDATE intents SET filled_quantity = ?, average_price = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE client_order_id = ?
@@ -181,5 +189,25 @@ class Persistence:
     def get_runtime_state(self, key: str) -> Optional[str]:
         row = self.conn.execute("SELECT value FROM runtime_state WHERE key = ?", (key,)).fetchone()
         if row:
-            return row['value']
+            return row["value"]
         return None
+
+    def append_audit_event(self, event_type: str, payload_json: str) -> int:
+        if not event_type or not isinstance(payload_json, str):
+            raise ValueError("audit event requires event_type and JSON payload text")
+        with self.conn:
+            cursor = self.conn.execute(
+                "INSERT INTO audit_events (event_type, payload_json) VALUES (?, ?)",
+                (event_type, payload_json),
+            )
+            return int(cursor.lastrowid)
+
+    def get_audit_events(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("audit limit must be a positive integer")
+        rows = self.conn.execute(
+            "SELECT event_id, event_type, payload_json, created_at "
+            "FROM audit_events ORDER BY event_id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
