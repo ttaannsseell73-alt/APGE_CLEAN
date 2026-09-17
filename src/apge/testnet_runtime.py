@@ -102,6 +102,8 @@ class TestnetRuntime:
     Exchange runtime around the accepted Binance adapter.
     Handles TESTNET validation, server time sync, loading exchange limits/filters.
     """
+    __test__ = False
+
     def __init__(self, adapter: BinanceAdapter):
         self.adapter = adapter
         self.server_time_offset: int = 0
@@ -232,10 +234,13 @@ class TestnetRuntime:
             self.execution_engine.risk_engine.system_state = SystemState.RECONCILING
             success = self.reconciler.resolve_state(self.symbol)
             if success:
-                logger.info("Reconciliation complete. Returning to OPERATIONAL.")
-                # Also refresh inventory
-                self.sync_inventory()
-                self.execution_engine.risk_engine.system_state = SystemState.OPERATIONAL
+                self.current_inventory = self.reconciler.last_position_amount
+                self.execution_engine.risk_engine.complete_reconciliation()
+                if self.execution_engine.risk_engine.system_state == SystemState.OPERATIONAL:
+                    logger.info("Reconciliation complete. Returning to OPERATIONAL.")
+                else:
+                    logger.error("Risk reconciliation did not reach OPERATIONAL. HALTING.")
+                    self.execution_engine.risk_engine.system_state = SystemState.HALTED
             else:
                 logger.error("Reconciliation failed upon reconnect. HALTING.")
                 self.execution_engine.risk_engine.system_state = SystemState.HALTED
@@ -366,14 +371,20 @@ class TestnetRuntime:
         to_create = desired_set - current_set
         to_cancel_keys = current_set - desired_set
 
-        # 4. Execute Cancellations
-        for key in to_cancel_keys:
-            cids = order_map[key]
+        # 4. Execute Cancellations deterministically.
+        for key in sorted(to_cancel_keys, key=lambda x: (x[0], x[1], x[2])):
+            cids = sorted(order_map[key])
             for cid in cids:
                 execution_engine.cancel_order(self.symbol, cid)
 
-        # 5. Execute Creations
-        for side, price, qty in to_create:
+        # If any cancel outcome was uncertain, fail closed before creating
+        # replacement exposure in the same cycle.
+        if execution_engine.risk_engine.system_state != SystemState.OPERATIONAL:
+            logger.warning("Grid cycle stopped after cancellation uncertainty; reconciliation required.")
+            return
+
+        # 5. Execute Creations deterministically.
+        for side, price, qty in sorted(to_create, key=lambda x: (x[0], x[1], x[2])):
             proposal = next((p for p in proposals if p.side == side and p.price == price and p.quantity == qty), None)
             if proposal:
                 execution_engine.execute_proposal(self.symbol, proposal)

@@ -10,7 +10,7 @@ class MockAdapter:
     def submit_limit_order(self, **kwargs):
         if kwargs["price"] == Decimal("999.0"):
             return {"status": "REJECTED"}
-        return {"status": "NEW", "orderId": "ext1", "clientOrderId": kwargs["client_order_id"]}
+        return {"status": "NEW", "orderId": "ext1", "clientOrderId": kwargs["client_order_id"], "executedQty": "0"}
 
     def _map_order_state(self, status):
         mapping = {"NEW": OrderState.OPEN, "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED, "FILLED": OrderState.FILLED}
@@ -60,6 +60,7 @@ def test_partial_and_full_fills(engine_setup):
         "trade_id": "trade1",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
+        "accumulated_filled_qty": Decimal("1.0"),
         "mapped_state": OrderState.PARTIALLY_FILLED, "order_status": "PARTIALLY_FILLED"
     })
 
@@ -74,6 +75,7 @@ def test_partial_and_full_fills(engine_setup):
         "trade_id": "trade1", # Same trade ID
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
+        "accumulated_filled_qty": Decimal("1.0"),
         "mapped_state": OrderState.PARTIALLY_FILLED, "order_status": "PARTIALLY_FILLED"
     })
 
@@ -88,6 +90,7 @@ def test_partial_and_full_fills(engine_setup):
         "trade_id": "trade2",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
+        "accumulated_filled_qty": Decimal("2.0"),
         "mapped_state": OrderState.FILLED, "order_status": "FILLED"
     })
 

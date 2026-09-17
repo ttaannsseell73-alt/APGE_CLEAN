@@ -4,10 +4,28 @@ from apge.simulator import RiskEngine, OrderState, RiskApproval, SystemState
 import pytest
 
 class MockPersistence:
+    def __init__(self):
+        self._fills = set()
+        self._filled = Decimal("0")
+
     def get_intent(self, cid):
-        return {"status": "OPEN", "exchange_order_id": None}
+        return {
+            "status": "OPEN",
+            "exchange_order_id": None,
+            "quantity": "1.0",
+            "filled_quantity": str(self._filled),
+        }
+
+    def has_fill(self, fill_id):
+        return fill_id in self._fills
+
     def add_fill(self, fill_id, client_order_id, quantity, price):
-        return True # Mock successful fill application
+        if fill_id in self._fills:
+            return False
+        self._fills.add(fill_id)
+        self._filled += quantity
+        return True
+
     def update_intent_status(self, *args, **kwargs):
         pass
 
@@ -39,6 +57,7 @@ def test_execution_engine_releases_risk_on_fill():
         "execution_type": "TRADE",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("70000"),
+        "accumulated_filled_qty": Decimal("1.0"),
         "trade_id": "999"
     }
 

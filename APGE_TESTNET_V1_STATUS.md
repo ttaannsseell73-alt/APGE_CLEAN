@@ -1,37 +1,67 @@
 # APGE TESTNET V1 STATUS
 
-## What Works (Offline/Mock Validated)
-The APGE V1 architecture has been implemented strictly against the reference designs and validated fully offline:
-* **Grid Strategy Integration:** The accepted deterministic grid proposals function correctly without AI/LLM interference.
-* **Binance TESTNET Adapter:** Fails closed natively. URL parsing strictly validates `testnet.binancefuture.com` and `fstream.binancefuture.com` and denies production endpoints and userinfo spoofing.
-* **Execution Engine:** Maintains immutable intents with deterministic `APGE_` client order IDs. State machine gracefully handles race conditions between incoming partial/full fills and cancel actions.
-* **Reconciliation:** Correctly queries unknown endpoints, accurately diffs local active orders vs exchange open orders, and successfully fails closed (transitions to `HALTED`) when corruption, indeterminate mismatch, or unauthorized exchange-only orders are found.
-* **UNKNOWN Submission Handling:** Models connection timeouts explicitly as `UNKNOWN`. It halts risk-increasing orders and safely waits for reconciliation to query the actual execution status.
-* **Market Data Ingestion:** Best bid/ask (BBA) values are tracked with receive timestamps. Staleness triggers reduce-only behavior according to the `is_stale_data` threshold.
+## Current canonical APGE-03 state
 
-## Testing Summary
+Base: `0c94e8a75e09a8cec0a57179c154f057f83cce04`
 
-### Offline & Mock Validated
-The entire integration logic was validated via mock transports and injected deterministic clock/time dependencies.
-* **pytest Suite:**
-  * Command: `PYTHONPATH=src pytest tests/`
-  * Pass Count: 89 passed
-  * Fail Count: 0 failed (2 collection warnings from `TestnetRuntime` naming)
-* **M3B Resilience Testing:**
-  * Command: `PYTHONPATH=src python3 experiments/APGE_Hybrid/m3b_nautilus_event_resilience_hardened_v2.py`
-  * Result: `[SUCCESS] M3B Validation Passed! Total Assertions: 2065`
-  * Note: M3B Nautilus event resilience behavior remains unaltered and 100% strictly enforced.
-* **M1/M2 Status:**
-  * Remain LEGACY BLOCKED and out of scope for V1 integration.
+Branch: `apge-03-controlled-grid-validation`
 
-### NOT Yet Validated (Real Binance TESTNET)
-No real network calls have been made using live Binance TESTNET credentials. The following remain entirely unverified against live Binance:
-* Actual WebSocket authentication and streaming reliability over extended durations.
-* True latency impact on local `server_time_offset`.
-* Real limit order placement, execution tracking, and cancellation confirmation.
-* Live partial fill event sequences.
+Draft PR: `#12`
 
-**We do NOT claim real Binance TESTNET trading works. It has not been executed yet.**
+Truthful status: **OFFLINE VALIDATED / AUTHENTICATED BINANCE FUTURES TESTNET GATE PENDING**.
 
-## Known Limitations / Blockers
-* None at this phase. The offline validation matches the intended state machine and Risk Engine contracts. The next required action is a manual live smoke test.
+## Offline validated
+
+The current APGE V1 path is validated offline with the real project modules and deterministic mocks:
+
+- deterministic grid proposal generation
+- signed BUY/SELL position accounting
+- side-aware worst-case exposure limits
+- immutable order side/symbol tracking
+- authoritative cancel -> RiskEngine lifecycle
+- missing/invalid cancel fill totals fail closed into reconciliation
+- duplicate fill and duplicate cancel idempotency
+- cancel/fill race handling
+- persistence/risk reconciliation rebuild
+- UNKNOWN submission fail-closed behavior
+- deterministic desired-vs-live grid diffing
+- cancel-before-create reprice behavior
+- 100-cycle create/cancel/recreate reservation-leak regression
+- server-time offset propagation into signed requests
+- strict TESTNET-only HTTP/WS endpoint validation
+
+## Offline regression gate
+
+GitHub Actions workflow: `.github/workflows/apge-offline.yml`
+
+Current suite:
+
+- collected: 118
+- passed: 118
+- failed: 0
+- skipped: 0
+
+`TestnetRuntime` pytest collection noise is handled explicitly in `tests/conftest.py`; warnings are not globally suppressed.
+
+## Not yet validated against authenticated Binance Futures TESTNET
+
+The following require an execution environment with Binance Futures TESTNET credentials and authenticated order/account endpoints:
+
+- authenticated position/open-order preflight
+- real LIMIT order placement
+- real exchange acknowledgement and clientOrderId correlation
+- duplicate-cycle proof against live exchange state
+- real cancellation confirmation with authoritative cumulative filled quantity
+- unexpected-fill handling against live TESTNET events
+- final exchange/local/risk reconciliation
+- authenticated user-data/WebSocket behavior over a real session
+
+The connected Binance integration available in this workspace is read-only market data. It cannot perform the authenticated TESTNET order mutation required for this gate.
+
+## Merge policy
+
+PR #12 remains draft.
+
+Do not label APGE-03 complete and do not merge it as a completed controlled-grid milestone until the authenticated TESTNET proof is attached and verified.
+
+No real-money endpoint is authorized.

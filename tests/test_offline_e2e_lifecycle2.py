@@ -86,20 +86,22 @@ def test_cancel_fill_race_condition(engine_setup):
     cid = "race1"
     db.save_intent(cid, "BTCUSDT", "BUY", Decimal("1.0"), Decimal("100"), OrderState.CANCELED)
 
-    # WS update arrives saying it's filled
+    # A websocket fill for persistence state that has no matching RiskEngine
+    # order is an inconsistent restart/race snapshot and must fail closed.
     engine.handle_order_update({
         "client_order_id": cid,
         "execution_type": "TRADE",
         "trade_id": "trade1",
         "last_filled_qty": Decimal("1.0"),
         "last_filled_price": Decimal("100.0"),
+        "accumulated_filled_qty": Decimal("1.0"),
         "mapped_state": OrderState.FILLED, "order_status": "FILLED"
     })
 
-    # It must be updated to FILLED
     intent = db.get_intent(cid)
-    assert intent["status"] == "FILLED"
-    assert Decimal(intent["filled_quantity"]) == Decimal("1.0")
+    assert intent["status"] == "UNKNOWN"
+    assert Decimal(intent["filled_quantity"]) == Decimal("0")
+    assert engine.risk_engine.system_state == SystemState.RECONCILING
 
 def test_unknown_blocks_risk_increasing_orders(engine_setup):
     engine, db = engine_setup

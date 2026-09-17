@@ -93,9 +93,11 @@ class _ApprovalRecord:
 class Order:
     """Local record of an order submitted to the exchange."""
 
-    def __init__(self, order_id: str, amount: Decimal):
+    def __init__(self, order_id: str, amount: Decimal, *, symbol: str = "", side: str = ""):
         self.order_id = order_id
         self.initial_amount = amount
+        self.symbol = symbol
+        self.side = str(side).upper()
         self.filled_amount = Decimal('0')         # sum of individually seen fills
         self.cancel_confirmed_total: Optional[Decimal] = None
         self.state = OrderState.UNKNOWN
@@ -125,10 +127,11 @@ class RiskEngine:
       risk-increasing approvals are denied.
     """
 
-    def __init__(self, position_limit: Decimal):
+    def __init__(self, position_limit: Decimal, *, require_explicit_side: bool = False):
         self._lock = threading.RLock()
 
         self.position_limit = position_limit
+        self.require_explicit_side = require_explicit_side
         self.current_position = Decimal('0')
         self.reservations = Decimal('0')
         self.system_state = SystemState.OPERATIONAL
@@ -155,7 +158,35 @@ class RiskEngine:
     # -- Capacity query ------------------------------------------------------
 
     def get_available_capacity(self) -> Decimal:
+        # Legacy scalar view retained for compatibility with older simulator tests.
         return self.position_limit - (self.current_position + self.reservations)
+
+    def _pending_for_side(self, side: str) -> Decimal:
+        side = self._normalize_side(side)
+        total = Decimal('0')
+        for record in self._approval_registry.values():
+            if record.side == side:
+                total += record.amount
+        for order in self.orders.values():
+            if order.side != side:
+                continue
+            if order.state in (OrderState.FILLED, OrderState.CANCELED):
+                continue
+            remaining = order.initial_amount - order.filled_amount
+            if remaining > 0:
+                total += remaining
+        return total
+
+    def get_available_capacity_for_side(self, side: str) -> Decimal:
+        """Worst-case signed capacity without netting opposite pending orders."""
+        side = self._normalize_side(side)
+        if side == 'BUY':
+            value = self.position_limit - (self.current_position + self._pending_for_side('BUY'))
+        elif side == 'SELL':
+            value = self.position_limit + self.current_position - self._pending_for_side('SELL')
+        else:
+            return Decimal('0')
+        return max(Decimal('0'), value)
 
     # -- Internal helpers ----------------------------------------------------
 
@@ -206,6 +237,28 @@ class RiskEngine:
             return False
         return val >= Decimal('0')
 
+    @staticmethod
+    def _normalize_side(side: str) -> str:
+        return str(side or "").upper()
+
+    def _position_delta(self, order: Order, amount: Decimal) -> Decimal:
+        """Translate an absolute fill delta into signed inventory movement.
+
+        Production runtimes require explicit BUY/SELL side. Legacy simulator
+        tests may omit side; in that compatibility mode only, the historical
+        positive-position behavior is retained. Explicit invalid sides are
+        rejected before an Order can be created.
+        """
+        if order.side == "BUY":
+            return amount
+        if order.side == "SELL":
+            return -amount
+        if self.require_explicit_side:
+            self.unresolved_conflicts.add(order.order_id)
+            self._enter_reconciling()
+            return Decimal('0')
+        return amount
+
     # -- Approval lifecycle --------------------------------------------------
 
     def request_approval(self, amount: Decimal, ttl_seconds: float = 5.0,
@@ -220,6 +273,13 @@ class RiskEngine:
         - insufficient capacity
         """
         with self._lock:
+            normalized_side = self._normalize_side(side)
+            if normalized_side and normalized_side not in ("BUY", "SELL"):
+                return None
+            if self.require_explicit_side and normalized_side not in ("BUY", "SELL"):
+                return None
+            side = normalized_side
+
             if self.system_state != SystemState.OPERATIONAL:
                 return None
 
@@ -230,7 +290,12 @@ class RiskEngine:
             if not self._is_valid_amount(amount):
                 return None
 
-            if self.get_available_capacity() >= amount:
+            if self.require_explicit_side:
+                has_capacity = self.get_available_capacity_for_side(side) >= amount
+            else:
+                has_capacity = self.get_available_capacity() >= amount
+
+            if has_capacity:
                 aid = self._next_approval_id
                 self._next_approval_id += 1
                 expires_at = self.get_time() + ttl_seconds
@@ -323,6 +388,13 @@ class RiskEngine:
             if approval.status != ApprovalStatus.VALID:
                 return False
 
+            if record.side and record.side not in ("BUY", "SELL"):
+                return self._reject_approval(
+                    approval, record, ApprovalStatus.REJECTED)
+            if self.require_explicit_side and record.side not in ("BUY", "SELL"):
+                return self._reject_approval(
+                    approval, record, ApprovalStatus.REJECTED)
+
             # --- TTL check (from record, not the mutable object) ---
             if self.get_time() > record.expires_at:
                 return self._reject_approval(
@@ -356,7 +428,8 @@ class RiskEngine:
 
             # Reservation transitions from "Approval" to "Order".
             # Use record.amount (the original), not approval.amount.
-            self.orders[order_id] = Order(order_id, record.amount)
+            self.orders[order_id] = Order(
+                order_id, record.amount, symbol=record.symbol, side=record.side)
             return True
 
     # -- Fill handling -------------------------------------------------------
@@ -416,7 +489,7 @@ class RiskEngine:
             order.filled_amount += amount
             order.seen_fills_sum += amount
             order.seen_fill_ids.append(fill_id)
-            self.current_position += amount
+            self.current_position += self._position_delta(order, amount)
             self.reservations -= amount
             self.processed_fills.add(fill_id)
 
@@ -436,61 +509,146 @@ class RiskEngine:
             if order_id in self.orders:
                 self.orders[order_id].cancel_requested = True
 
-    def on_cancel_confirmed(self, order_id: str, final_filled_amount: Decimal):
-        """Exchange confirmed the cancel with the authoritative fill total.
-
-        Consistency checks:
-        - final_filled_amount must be finite and non-negative
-        - final_filled_amount must not exceed order.initial_amount
-        - final_filled_amount must not be less than observed fills
-        Any inconsistency → RECONCILING, no silent risk deletion.
-        """
+    def on_cancel_confirmed(self, order_id: str, final_filled_amount: Decimal) -> bool:
+        """Apply an authoritative cancel total. Returns True only when consistent."""
         with self._lock:
-            # --- Input validation (Bug 6) ---
             if not self._is_valid_non_negative(final_filled_amount):
                 self._enter_reconciling()
-                return
+                return False
 
             if order_id not in self.orders:
-                return
+                self._enter_reconciling()
+                return False
             order = self.orders[order_id]
+
             if order.state == OrderState.CANCELED:
-                return  # idempotent
+                if order.cancel_confirmed_total == final_filled_amount:
+                    return True
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                return False
 
-            # --- Bounds check: total can't exceed order size (Bug 5) ---
+            if order.state == OrderState.FILLED:
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                return False
+
             if final_filled_amount > order.initial_amount:
-                # Inconsistent data — do not consider this a definitive cancel
-                # and do NOT release any reservations. Preserve worst-case risk.
                 self.unresolved_conflicts.add(order_id)
                 self._enter_reconciling()
                 self._bump_risk_version()
-                return
+                return False
 
-            # --- Downward revision check ---
             if final_filled_amount < order.filled_amount:
-                # Exchange says less filled than we recorded — inconsistency
-                # Do not consider this a definitive cancel.
                 self.unresolved_conflicts.add(order_id)
                 self._enter_reconciling()
                 self._bump_risk_version()
-                return
+                return False
 
             order.state = OrderState.CANCELED
             order.cancel_confirmed_total = final_filled_amount
 
-            # Sync: the exchange may have filled more than we observed
             diff = final_filled_amount - order.filled_amount
             if diff > 0:
                 order.filled_amount += diff
-                self.current_position += diff
+                self.current_position += self._position_delta(order, diff)
                 self.reservations -= diff
 
-            # Release the un-filled remainder
             remaining = order.initial_amount - order.filled_amount
             if remaining > 0:
                 self.reservations -= remaining
 
+            if self.reservations < 0:
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                return False
+
             self._bump_risk_version()
+            return True
+
+    def rebuild_from_authoritative_state(self, current_position: Decimal, intents: List[dict]) -> bool:
+        """Rebuild in-memory risk state from an exchange/persistence reconciliation snapshot."""
+        with self._lock:
+            if not isinstance(current_position, Decimal) or current_position.is_nan() or current_position.is_infinite():
+                self._enter_reconciling()
+                return False
+
+            rebuilt: Dict[str, Order] = {}
+            reservations = Decimal('0')
+            buy_pending = Decimal('0')
+            sell_pending = Decimal('0')
+
+            for intent in intents:
+                status_name = str(intent.get('status', ''))
+                if status_name == 'REJECTED':
+                    continue
+                try:
+                    state = OrderState[status_name]
+                    qty = Decimal(str(intent['quantity']))
+                    filled = Decimal(str(intent.get('filled_quantity', '0')))
+                    observed = Decimal(str(intent.get('observed_filled_quantity', filled)))
+                except Exception:
+                    self._enter_reconciling()
+                    return False
+
+                side = self._normalize_side(intent.get('side', ''))
+                symbol = str(intent.get('symbol', ''))
+                cid = str(intent.get('client_order_id', ''))
+                if not cid or not symbol or side not in ('BUY', 'SELL'):
+                    self._enter_reconciling()
+                    return False
+                if not self._is_valid_amount(qty):
+                    self._enter_reconciling()
+                    return False
+                if not self._is_valid_non_negative(filled) or filled > qty:
+                    self._enter_reconciling()
+                    return False
+                if not self._is_valid_non_negative(observed) or observed > filled:
+                    self._enter_reconciling()
+                    return False
+                if state == OrderState.FILLED and filled != qty:
+                    self._enter_reconciling()
+                    return False
+                if state == OrderState.OPEN and filled != 0:
+                    self._enter_reconciling()
+                    return False
+                if state == OrderState.PARTIALLY_FILLED and not (Decimal('0') < filled < qty):
+                    self._enter_reconciling()
+                    return False
+
+                order = Order(cid, qty, symbol=symbol, side=side)
+                order.filled_amount = filled
+                order.seen_fills_sum = observed
+                order.state = state
+                if state == OrderState.CANCELED:
+                    order.cancel_requested = True
+                    order.cancel_confirmed_total = filled
+
+                rebuilt[cid] = order
+                if state not in (OrderState.FILLED, OrderState.CANCELED):
+                    remaining = qty - filled
+                    reservations += remaining
+                    if side == 'BUY':
+                        buy_pending += remaining
+                    else:
+                        sell_pending += remaining
+
+            if current_position + buy_pending > self.position_limit:
+                self._enter_reconciling()
+                return False
+            if current_position - sell_pending < -self.position_limit:
+                self._enter_reconciling()
+                return False
+
+            self.current_position = current_position
+            self.reservations = reservations
+            self.orders = rebuilt
+            self.active_approvals = []
+            self._approval_registry = {}
+            self.unresolved_conflicts = set()
+            self.processed_fills = set()
+            self._bump_risk_version()
+            return True
 
     # -- Connection / state transitions --------------------------------------
 
@@ -538,55 +696,62 @@ class RiskEngine:
     # -- Order state helpers (for reconciliation use) ------------------------
 
     def resolve_order(self, order_id: str, final_state: OrderState,
-                      final_filled: Decimal):
-        """Resolve an UNKNOWN order during reconciliation.
-
-        This is called when the exchange confirms the true status of an
-        order via Client Order ID lookup.
-        Validates that final_filled is within [0, initial_amount].
-        """
+                      final_filled: Decimal) -> bool:
+        """Resolve an UNKNOWN order from authoritative exchange state."""
         with self._lock:
             if not self._is_valid_non_negative(final_filled):
                 self._enter_reconciling()
-                return
-
+                return False
             if order_id not in self.orders:
-                return
+                self._enter_reconciling()
+                return False
+
             order = self.orders[order_id]
             if order.state != OrderState.UNKNOWN:
-                return
-
-            # --- Bounds check (Bug 5) ---
-            if final_filled > order.initial_amount:
-                # Inconsistent data — do not consider this a definitive resolution
-                # and do NOT release any reservations. Preserve worst-case risk.
+                return order.state == final_state and order.filled_amount == final_filled
+            if final_filled > order.initial_amount or final_filled < order.filled_amount:
                 self.unresolved_conflicts.add(order_id)
                 self._enter_reconciling()
                 self._bump_risk_version()
-                return
+                return False
 
-            if final_state == OrderState.FILLED:
-                diff = final_filled - order.filled_amount
-                if diff > 0:
-                    order.filled_amount += diff
-                    self.current_position += diff
-                    self.reservations -= diff
-                order.state = OrderState.FILLED
+            if final_state == OrderState.OPEN:
+                valid_state = final_filled == Decimal('0')
+            elif final_state == OrderState.PARTIALLY_FILLED:
+                valid_state = Decimal('0') < final_filled < order.initial_amount
+            elif final_state == OrderState.FILLED:
+                valid_state = final_filled == order.initial_amount
             elif final_state == OrderState.CANCELED:
-                order.state = OrderState.CANCELED
+                valid_state = Decimal('0') <= final_filled <= order.initial_amount
+            else:
+                valid_state = False
+
+            if not valid_state:
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                self._bump_risk_version()
+                return False
+
+            diff = final_filled - order.filled_amount
+            if diff > 0:
+                order.filled_amount += diff
+                self.current_position += self._position_delta(order, diff)
+                self.reservations -= diff
+
+            if final_state == OrderState.CANCELED:
+                order.cancel_requested = True
                 order.cancel_confirmed_total = final_filled
-                diff = final_filled - order.filled_amount
-                if diff > 0:
-                    order.filled_amount += diff
-                    self.current_position += diff
-                    self.reservations -= diff
                 remaining = order.initial_amount - order.filled_amount
                 if remaining > 0:
                     self.reservations -= remaining
-            elif final_state == OrderState.OPEN:
-                order.state = OrderState.OPEN
 
+            order.state = final_state
+            if self.reservations < 0:
+                self.unresolved_conflicts.add(order_id)
+                self._enter_reconciling()
+                return False
             self._bump_risk_version()
+            return True
 
     def resolve_conflict(self, order_id: str, final_filled: Decimal):
         """Resolve a persistent data conflict with verified reconciliation data.
@@ -617,7 +782,7 @@ class RiskEngine:
             # Apply the resolution
             diff = final_filled - order.filled_amount
             order.filled_amount += diff
-            self.current_position += diff
+            self.current_position += self._position_delta(order, diff)
             
             # The order is now definitively resolved and considered CANCELED,
             # so it holds 0 reservations. Release whatever it was holding before.
