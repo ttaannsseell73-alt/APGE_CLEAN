@@ -34,11 +34,20 @@ jobs:
           python -m pip install -e .
           python -m pip install pytest
 
-      - name: Verify installed package import
-        run: python -c "import apge; import apge.backtest; import apge.execution_engine"
+      - name: Verify installed package
+        run: |
+          python -m compileall -q src
+          python -c "import apge; import apge.backtest; import apge.execution_engine; import apge.recovery"
+          apge-bot --help >/dev/null
 
       - name: Collect tests
         run: python -m pytest --collect-only -q
 
       - name: Run offline suite
         run: python -m pytest -q
+
+      - name: Run deterministic runner smoke
+        env:
+          APGE_DB_PATH: runner-smoke.sqlite3
+          APGE_MAX_CYCLES: '1'
+        run: apge-bot --dry-run
