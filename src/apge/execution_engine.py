@@ -5,7 +5,7 @@ import logging
 import hashlib
 
 from apge.persistence import Persistence
-from apge.binance_adapter import BinanceAdapter
+from apge.exchange import ExchangeAdapter
 from apge.simulator import RiskEngine, OrderState, SystemState
 from apge.grid_strategy import OrderProposal
 
@@ -16,7 +16,7 @@ class ExecutionEngine:
     Execution layer that converts approved OrderProposal objects into exchange intents.
     Manages deterministic clientOrderId, intent tracking, submit/cancel state machine.
     """
-    def __init__(self, persistence: Persistence, adapter: BinanceAdapter, risk_engine: RiskEngine):
+    def __init__(self, persistence: Persistence, adapter: ExchangeAdapter, risk_engine: RiskEngine):
         self.persistence = persistence
         self.adapter = adapter
         self.risk_engine = risk_engine
