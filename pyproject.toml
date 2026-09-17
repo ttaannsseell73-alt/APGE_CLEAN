@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apge"
+version = "0.1.0"
+description = "Adaptive Perpetual Grid Engine deterministic V1 core"
+requires-python = ">=3.12"
+dependencies = [
+  "requests>=2.32,<3",
+  "websocket-client>=1.8,<2",
+]
+
+[project.scripts]
+apge-bot = "apge.bot_runner:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
