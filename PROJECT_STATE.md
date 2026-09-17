@@ -2,6 +2,61 @@
 
 Last updated: 2026-09-17
 
+## Active repository delivery — APGE-07
+
+User-authorized continuation branch: `apge-repository-completion-v1`.
+
+Starting HEAD: `c9e2ccf2c720151ae918d58b6d6927c156e4fb30`.
+Starting tree: `fdab742722ca54541d5b59b9b2b1d1f945feed25`.
+
+Verified at start:
+- Offline run `35220917934`: SUCCESS, 166 collected / 166 passed / 0 failed / 0 skipped.
+- Repository release run `35220917769`: all seven jobs SUCCESS.
+- Fixed historical research run `35220917750`: execution SUCCESS; strategy gate NOT_PASSED.
+- `main` remains `0c94e8a75e09a8cec0a57179c154f057f83cce04`.
+- Draft PRs #12 and #13 remain unmerged; no open standalone issues.
+
+APGE-07 status: **REVIEW — local adaptive runner / packaging PASS; final GitHub CI pending**.
+
+Acceptance criteria:
+- The normal runner uses AdaptiveGridDecision through the existing controller,
+  ExecutionEngine and RiskEngine, with configured regime/policy parameters.
+- Authenticated TESTNET reads closed candles and a validated funding snapshot;
+  incomplete, stale, malformed or inconsistent data cannot submit new orders.
+- The default dry runner stays offline and explicitly identifies synthetic data.
+- Regression tests prove regime gates, configured spacing, cancellation before
+  replacement, restart isolation and truthful fail-closed shutdown evidence.
+- Package installation/entrypoint and full offline suite pass on the delivered tree;
+  GitHub CI is verified at the exact resulting commit.
+
+Open gates remain APGE-03 authenticated controlled TESTNET validation and APGE-06
+strategy robustness. Completing repository code does not pass either gate.
+
+Implemented and directly validated:
+- normal runner uses the configured adaptive controller; static NEUTRAL was removed;
+- closed/contiguous/fresh kline and funding boundary, including calendar months;
+- actual WebSocket freshness, listen-key expiry and event serialization;
+- cancel-fill inventory changes and account/trade mismatches block replacement;
+- mode/symbol database isolation and clean/unclean shutdown evidence;
+- 205 offline tests PASS / 0 failed / 0 errors / 0 skips / 0 warnings;
+- isolated wheel build, installation and two-cycle synthetic executable smoke PASS;
+- unified release workflow now includes an isolated wheel job.
+
+No new authenticated exchange gate was run. In this environment both TESTNET
+credential variables are unset; available Binance tools are public read-only.
+Details: `docs/APGE_07_ADAPTIVE_RUNNER.md`.
+
+| Open work | Current status | Required evidence |
+| --- | --- | --- |
+| APGE-03 authenticated controlled grid | BLOCKED / #12 DRAFT | TESTNET credentials and exact-checkout controlled validation |
+| APGE-06 strategy robustness | NOT_PASSED | Frozen revised hypothesis / separate training / genuinely unseen validation |
+| APGE-07 adaptive runner delivery | REVIEW | Final GitHub CI and durable commit |
+| Android monitoring / later operations | DEFERRED | Earlier promotion and strategy/risk gates |
+
+The allowed independent continuation is APGE-06 research design. Previously
+observed July and September holdouts must not become fresh holdouts by renaming
+them or by changing parameters after inspecting their results.
+
 ## Canonical main
 
 `main`: `0c94e8a75e09a8cec0a57179c154f057f83cce04`

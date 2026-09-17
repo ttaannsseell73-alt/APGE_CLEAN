@@ -11,3 +11,6 @@ __pycache__/
 !.env.example
 scratch/
 .agy/
+*.egg-info/
+build/
+dist/

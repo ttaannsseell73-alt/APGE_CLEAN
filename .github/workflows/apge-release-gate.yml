@@ -11,6 +11,48 @@ permissions:
   contents: read
 
 jobs:
+  packaging:
+    name: release-wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build wheel and verify isolated installation
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          python -m venv "$RUNNER_TEMP/apge-wheel-venv"
+          "$RUNNER_TEMP/apge-wheel-venv/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/apge-wheel-venv/bin/apge-bot" --help >/dev/null
+          APGE_DB_PATH="$RUNNER_TEMP/wheel-smoke.sqlite3" APGE_MAX_CYCLES=2 "$RUNNER_TEMP/apge-wheel-venv/bin/apge-bot" --dry-run
+          "$RUNNER_TEMP/apge-wheel-venv/bin/python" - <<'PY'
+          import json
+          import os
+          import apge
+          from apge.persistence import Persistence
+          from apge.recovery import RecoveryManager
+          assert os.path.abspath(apge.__file__).startswith(os.environ["RUNNER_TEMP"] + "/apge-wheel-venv/")
+          db = Persistence(os.environ["RUNNER_TEMP"] + "/wheel-smoke.sqlite3")
+          try:
+              assert db.get_active_intents() == []
+              assert RecoveryManager(db).load().clean_shutdown is True
+              decisions = [json.loads(e["payload_json"]) for e in db.get_audit_events() if e["event_type"] == "adaptive_decision"]
+              assert len(decisions) == 2
+              assert all(e["source"] == "SYNTHETIC_OFFLINE" for e in decisions)
+              print("Isolated wheel adaptive smoke PASS")
+          finally:
+              db.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
   offline:
     name: release-offline
     runs-on: ubuntu-latest

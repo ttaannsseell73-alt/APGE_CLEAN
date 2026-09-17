@@ -4,6 +4,7 @@ import threading
 import json
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
+from functools import wraps
 
 from apge.binance_adapter import BinanceAdapter
 from apge.grid_strategy import generate_grid_proposals, MarketRegime
@@ -12,8 +13,17 @@ from apge.simulator import SystemState
 logger = logging.getLogger(__name__)
 
 
+def _serialized_event(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.event_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class TestnetWebsocketTransport:
     """TESTNET WebSocket loop with fail-closed reconnect semantics."""
+    __test__ = False
 
     def __init__(self, ws_url: str, runtime: "TestnetRuntime", listen_key: str = ""):
         self.ws_url = ws_url
@@ -40,6 +50,8 @@ class TestnetWebsocketTransport:
                 pass
         if self._thread:
             self._thread.join(timeout=2.0)
+            return not self._thread.is_alive()
+        return True
 
     def _run_loop(self):
         try:
@@ -71,23 +83,31 @@ class TestnetWebsocketTransport:
                 time.sleep(1)
 
     def _on_open(self, ws):
-        self.runtime.handle_stream_open(self.stream_name)
+        if self._running:
+            self.runtime.handle_stream_open(self.stream_name)
 
     def _on_message(self, ws, message):
+        if not self._running:
+            return
         try:
             data = json.loads(message)
             event_type = data.get("e")
             if event_type == "bookTicker":
-                self.runtime.handle_book_ticker(data)
+                self.runtime.handle_book_ticker(data, from_stream=True)
             elif event_type in ("ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE"):
                 self.runtime.handle_user_data_event(data, self.runtime.execution_engine)
+            elif event_type == "listenKeyExpired":
+                self.runtime.handle_stream_loss("user")
+            elif self.stream_name == "user":
+                raise ValueError("unsupported user-data event")
         except Exception as exc:
             logger.error("Invalid %s websocket event: %s", self.stream_name, exc)
             self.runtime.handle_data_uncertainty()
 
     def _on_error(self, ws, error):
         logger.error("WS %s error: %s", self.stream_name, error)
-        self.runtime.handle_stream_loss(self.stream_name)
+        if self._running:
+            self.runtime.handle_stream_loss(self.stream_name)
 
     def _on_close(self, ws, close_status_code, close_msg):
         logger.info("WS %s closed: %s %s", self.stream_name, close_status_code, close_msg)
@@ -101,6 +121,7 @@ class TestnetRuntime:
 
     def __init__(self, adapter: BinanceAdapter):
         self.adapter = adapter
+        self.event_lock = threading.RLock()
         self.server_time_offset: int = 0
         self.tick_size: Optional[Decimal] = None
         self.step_size: Optional[Decimal] = None
@@ -110,6 +131,7 @@ class TestnetRuntime:
         self.best_ask: Optional[Decimal] = None
         self.bba_timestamp: int = 0
         self.bba_receive_timestamp: int = 0
+        self.bba_stream_receive_timestamp: int = 0
         self.stale_data_threshold_ms: int = 5000
         self.is_connected: bool = False
         self.stream_health: Dict[str, bool] = {"market": False, "user": False}
@@ -176,7 +198,8 @@ class TestnetRuntime:
             logger.error("Failed to load exchange info: %s", exc)
             return False
 
-    def handle_book_ticker(self, event: Dict[str, Any]):
+    @_serialized_event
+    def handle_book_ticker(self, event: Dict[str, Any], *, from_stream: bool = False):
         parsed = self.adapter.parse_book_ticker(event)
         if self.symbol and parsed["symbol"] != self.symbol:
             raise ValueError("bookTicker symbol mismatch")
@@ -190,14 +213,23 @@ class TestnetRuntime:
         self.best_bid = parsed["bid_price"]
         self.best_ask = parsed["ask_price"]
         self.bba_timestamp = self.bba_receive_timestamp
-        self.stream_health["market"] = True
-        self.is_connected = True
+        if from_stream:
+            self.bba_stream_receive_timestamp = self.bba_receive_timestamp
+        if from_stream or not self.ws_transports:
+            self.stream_health["market"] = True
+        self.is_connected = all(self.stream_health.values()) if self.ws_transports else True
 
+    @_serialized_event
     def is_stale_data(self) -> bool:
         if not self.is_connected or self.best_bid is None or self.best_ask is None:
             return True
-        return (int(time.time() * 1000) - self.bba_receive_timestamp) > self.stale_data_threshold_ms
+        now = int(time.time() * 1000)
+        if self.ws_transports and (not all(self.stream_health.values()) or not self.bba_stream_receive_timestamp or
+                                   now - self.bba_stream_receive_timestamp > self.stale_data_threshold_ms):
+            return True
+        return now - self.bba_receive_timestamp > self.stale_data_threshold_ms
 
+    @_serialized_event
     def handle_stream_open(self, stream_name: str):
         if stream_name not in self.stream_health:
             self.handle_data_uncertainty()
@@ -210,16 +242,21 @@ class TestnetRuntime:
                     SystemState.CONNECTION_LOST, SystemState.RECONCILING)):
             self.handle_reconnect()
 
+    @_serialized_event
     def handle_stream_loss(self, stream_name: str):
         if stream_name in self.stream_health:
             self.stream_health[stream_name] = False
+        if stream_name == "market":
+            self.bba_stream_receive_timestamp = 0
         self.handle_connection_loss()
 
+    @_serialized_event
     def handle_data_uncertainty(self):
         self.is_connected = False
         if self.execution_engine:
             self.execution_engine.risk_engine.restore_connection()
 
+    @_serialized_event
     def handle_connection_loss(self):
         self.is_connected = False
         if self.execution_engine:
@@ -227,6 +264,7 @@ class TestnetRuntime:
             if risk.system_state != SystemState.HALTED:
                 risk.system_state = SystemState.CONNECTION_LOST
 
+    @_serialized_event
     def handle_reconnect(self):
         if not all(self.stream_health.values()):
             return
@@ -265,6 +303,7 @@ class TestnetRuntime:
         ws_domain = self.adapter.ws_url
         self.stream_health = {"market": False, "user": False}
         self.is_connected = False
+        self.bba_stream_receive_timestamp = 0
         # Once asynchronous event ingestion begins, both streams must establish
         # and an authoritative reconciliation must complete before new exposure.
         if self.execution_engine and self.execution_engine.risk_engine.system_state == SystemState.OPERATIONAL:
@@ -283,12 +322,18 @@ class TestnetRuntime:
     def stop_event_loops(self):
         transports = list(self.ws_transports)
         self.ws_transports = []
+        stopped = True
         for ws in transports:
-            ws.stop()
+            stopped = ws.stop() is not False and stopped
         self.stream_health = {"market": False, "user": False}
         self.is_connected = False
+        return stopped
 
     def handle_user_data_event(self, event: Dict[str, Any], execution_engine: Any):
+        with self.event_lock:
+            self._apply_user_data_event(event, execution_engine)
+
+    def _apply_user_data_event(self, event: Dict[str, Any], execution_engine: Any):
         event_type = event.get("e")
         if event_type == "ACCOUNT_UPDATE":
             parsed = self.adapter.parse_account_update(event)
@@ -298,6 +343,11 @@ class TestnetRuntime:
                     if value.is_nan() or value.is_infinite():
                         raise ValueError("invalid account inventory")
                     self.current_inventory = value
+                    if value != execution_engine.risk_engine.current_position:
+                        # Account and trade events can be reordered, and an
+                        # external position change is also possible. Resolve the
+                        # discrepancy from REST before further reservations.
+                        execution_engine.risk_engine.restore_connection()
         elif event_type == "ORDER_TRADE_UPDATE":
             parsed = self.adapter.parse_order_trade_update(event)
             if self.symbol and parsed["symbol"] != self.symbol:
