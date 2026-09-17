@@ -5,6 +5,7 @@ from typing import Iterable, Sequence
 from apge.adaptive_policy import AdaptivePolicyConfig, build_adaptive_grid_decision
 from apge.grid_strategy import MarketRegime, OrderProposal, generate_grid_proposals
 from apge.market_regime import Candle, RegimeConfig, assess_market_regime
+from apge.simulator import SystemState
 
 
 @dataclass(frozen=True)
@@ -60,10 +61,6 @@ class BacktestResult:
 
 def _finite(value: Decimal) -> bool:
     return isinstance(value, Decimal) and not value.is_nan() and not value.is_infinite()
-
-
-def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
-    return (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
 
 
 def _validate_config(config: BacktestConfig) -> None:
@@ -142,13 +139,13 @@ def _select_fills(
     # to the bar's close direction / current inventory. This is intentionally
     # conservative and deterministic.
     if current_position > 0:
-        selected_side = "BUY"  # increases long inventory
+        selected_side = "BUY"
     elif current_position < 0:
-        selected_side = "SELL"  # increases short inventory
+        selected_side = "SELL"
     elif bar.close > bar.open:
-        selected_side = "SELL"  # short into an up-close bar
+        selected_side = "SELL"
     else:
-        selected_side = "BUY"  # long into a down/doji close bar
+        selected_side = "BUY"
     return [proposal for proposal in touched if proposal.side == selected_side]
 
 
@@ -193,8 +190,6 @@ def run_backtest(
     if len(candles) < regime_config.lookback + 1:
         raise ValueError("insufficient candles for backtest")
     for candle in candles:
-        # Reuse the classifier's strict validation without exporting internals by
-        # validating through a one-window call below before a candle is traded.
         if not all(_finite(v) and v > 0 for v in (candle.open, candle.high, candle.low, candle.close)):
             raise ValueError("candles must contain finite positive Decimals")
         if candle.low > candle.high or candle.open < candle.low or candle.open > candle.high or candle.close < candle.low or candle.close > candle.high:
@@ -248,23 +243,15 @@ def run_backtest(
             max_inventory=config.max_inventory,
             tick_size=config.tick_size,
             step_size=config.step_size,
-            system_state=__import__("apge.simulator", fromlist=["SystemState"]).SystemState.OPERATIONAL,
+            system_state=SystemState.OPERATIONAL,
             market_regime=decision.regime,
             is_stale_data=False,
             inventory_target=decision.target_inventory,
             inventory_skew_strength=decision.inventory_skew_strength,
         )
         proposals = _filter_proposals(proposals, config)
-        selected = _select_fills(
-            proposals,
-            execution_bar,
-            position,
-            config.conservative_dual_touch,
-        )
+        selected = _select_fills(proposals, execution_bar, position, config.conservative_dual_touch)
 
-        # Process closer-to-market orders first on each side and reject any fill
-        # that would violate the same hard inventory envelope used by GridStrategy.
-        selected.sort(key=lambda p: p.price, reverse=True if selected and selected[0].side == "BUY" else False)
         for proposal in selected:
             signed_qty = proposal.quantity if proposal.side == "BUY" else -proposal.quantity
             candidate_position = position + signed_qty
@@ -281,7 +268,6 @@ def run_backtest(
             fills.append(Fill(index, proposal.side, proposal.price, proposal.quantity, fee))
             max_abs_inventory = max(max_abs_inventory, abs(position))
 
-        # Linear perpetual funding: positive rate means longs pay and shorts receive.
         funding_payment = position * execution_bar.close * funding_rates[index]
         cash -= funding_payment
         total_funding += funding_payment
