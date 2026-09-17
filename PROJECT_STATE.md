@@ -81,15 +81,54 @@ Implemented:
 
 Status: **PAPER IMPLEMENTATION PASS / NOT CANONICAL**
 
+## APGE-06 — Strategy Robustness Research
+
+Research branch: `apge-prelive-completion-v1`
+
+Latest train/holdout research checkout: `9ae45ab611c4ca1355d159da7fe83e09e82d13c5`
+
+Software/regression evidence:
+- fill-confirmation hardening checkout `541ef0ba057dcb65ab0a71e23064ed4c7198b71f`: 160/160 pytest PASS
+- stress walk-forward workflow: PASS as a structural/risk execution
+- train/holdout workflow: PASS as a reproducible research execution
+
+Strategy evidence:
+- 28-day baseline walk-forward: 1/4 positive weeks, aggregate +3.60887426
+- 1 bp fill-confirmation stress: 1/4 positive, aggregate -3.48497202
+- 2 bp fill-confirmation stress: 1/4 positive, aggregate -9.40008244
+- 1 bp + doubled fee: 1/4 positive, aggregate -11.07364404
+
+Train-only parameter search selected:
+- base spacing 16 bps
+- volatility spacing multiplier 2.0
+- 5/6 positive training weeks
+- aggregate train PnL +4.26467224
+- median train week +0.98721201
+
+Untouched two-week holdout:
+- 1/2 positive weeks
+- aggregate PnL -3.21227672
+- 1 bp fill-confirmation holdout stress aggregate -1.73725250
+
+Status: **STRATEGY ROBUSTNESS GATE NOT PASSED**
+
+Meaning:
+- engine/risk implementation remains technically validated in the tested scope;
+- current adaptive strategy has not demonstrated robust positive expectancy;
+- no real-money promotion is allowed from this evidence.
+
+See `docs/APGE_06_STRATEGY_RESEARCH.md`.
+
 ## Promotion order
 
 1. Run authenticated APGE-03 controlled Binance Futures TESTNET validation.
 2. Verify generated evidence against the exact APGE-03 checkout.
 3. Only then mark PR #12 ready and merge to `main`.
-4. Reconcile/rebase downstream APGE-04/05 work onto the new canonical `main`.
-5. Re-run the full offline/paper CI gate on the exact promoted checkout.
-6. Promote adaptive/paper work only after those gates remain green.
-7. Proceed to extended forward paper validation and, only after explicit statistical/risk gates, a separate very-small-capital live-validation milestone.
+4. Reconcile/rebase downstream APGE-04/05/06 work onto the new canonical `main`.
+5. Re-run the full offline/paper/public-data CI gate on the exact promoted checkout.
+6. Continue strategy research on a genuinely unseen period; do not tune against the already-observed September holdout.
+7. Require an explicit statistical robustness gate before any real-capital milestone.
+8. Only after robust paper/holdout evidence and a separately approved risk gate may a very-small-capital live-validation milestone be designed.
 
 ## Safety locks
 
@@ -99,3 +138,4 @@ Status: **PAPER IMPLEMENTATION PASS / NOT CANONICAL**
 - AI/LLM/RL does not control V1 money management or bypass RiskEngine.
 - Unknown exchange outcomes fail closed into reconciliation.
 - Test PASS is not treated as canonical completion without durable commit/branch, reproducibility, and explicit merge state.
+- Positive aggregate backtest PnL is not treated as proof of positive expectancy.
