@@ -5,6 +5,8 @@ on:
     branches:
       - apge-03-controlled-grid-validation
       - apge-prelive-completion-v1
+      - apge-repository-completion-v1
+      - release/apge-v1-rc1
   pull_request:
     branches:
       - main
@@ -26,15 +28,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install test dependency
-        run: python -m pip install --upgrade pip pytest
+      - name: Clean install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest
+
+      - name: Verify installed package import
+        run: python -c "import apge; import apge.backtest; import apge.execution_engine"
 
       - name: Collect tests
-        env:
-          PYTHONPATH: src
         run: python -m pytest --collect-only -q
 
       - name: Run offline suite
-        env:
-          PYTHONPATH: src
         run: python -m pytest -q
