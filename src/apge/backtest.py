@@ -25,6 +25,15 @@ class BacktestConfig:
     # before granting a fill. Zero preserves the original touch model. Positive
     # values are useful for conservative queue/fill-uncertainty stress tests.
     fill_confirmation_bps: Decimal = Decimal("0")
+    # Explicit adverse execution-cost stress. For resting LIMIT orders this is a
+    # conservative proxy for impact/adverse selection, not an assertion that the
+    # venue executes a limit beyond its price.
+    slippage_bps: Decimal = Decimal("0")
+    # Additional whole-candle delay between the information set used to construct
+    # a grid and the candle on which it becomes executable. Candle backtests cannot
+    # represent millisecond latency; this parameter provides a deterministic coarse
+    # latency stress model.
+    decision_latency_bars: int = 0
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,7 @@ class BacktestResult:
     max_abs_inventory: Decimal
     total_fees: Decimal
     total_funding: Decimal
+    total_slippage: Decimal
     turnover: Decimal
     fill_count: int
     bars_processed: int
@@ -79,6 +89,7 @@ def _validate_config(config: BacktestConfig) -> None:
         config.synthetic_spread_bps,
         config.fee_rate,
         config.fill_confirmation_bps,
+        config.slippage_bps,
     )
     if any(not _finite(value) for value in decimal_values):
         raise ValueError("backtest configuration must contain finite Decimals")
@@ -94,6 +105,10 @@ def _validate_config(config: BacktestConfig) -> None:
         raise ValueError("synthetic spread must be positive")
     if config.fill_confirmation_bps < 0 or config.fill_confirmation_bps >= Decimal("10000"):
         raise ValueError("fill confirmation must be in [0, 10000) bps")
+    if config.slippage_bps < 0 or config.slippage_bps >= Decimal("10000"):
+        raise ValueError("slippage must be in [0, 10000) bps")
+    if not isinstance(config.decision_latency_bars, int) or config.decision_latency_bars < 0:
+        raise ValueError("decision_latency_bars must be a non-negative integer")
     if config.level_count <= 0:
         raise ValueError("level count must be positive")
 
@@ -121,8 +136,6 @@ def _filter_proposals(proposals: Iterable[OrderProposal], config: BacktestConfig
 def _touched(proposal: OrderProposal, bar: Candle, confirmation_bps: Decimal) -> bool:
     fraction = confirmation_bps / Decimal("10000")
     if proposal.side == "BUY":
-        # A conservative BUY fill requires the market to trade below the limit,
-        # not merely print the exact limit, when confirmation_bps > 0.
         threshold = proposal.price * (Decimal("1") - fraction)
         return bar.low <= threshold
     if proposal.side == "SELL":
@@ -168,19 +181,29 @@ def _apply_fill(
     position: Decimal,
     proposal: OrderProposal,
     fee_rate: Decimal,
-) -> tuple[Decimal, Decimal, Decimal, Decimal]:
-    notional = proposal.price * proposal.quantity
+    slippage_bps: Decimal,
+) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]:
+    slip_fraction = slippage_bps / Decimal("10000")
+    if proposal.side == "BUY":
+        execution_price = proposal.price * (Decimal("1") + slip_fraction)
+    elif proposal.side == "SELL":
+        execution_price = proposal.price * (Decimal("1") - slip_fraction)
+    else:
+        raise ValueError(f"unknown side {proposal.side}")
+    if execution_price <= 0:
+        raise ValueError("slippage produced non-positive execution price")
+
+    notional = execution_price * proposal.quantity
     fee = abs(notional) * fee_rate
+    slippage_cost = abs(execution_price - proposal.price) * proposal.quantity
     if proposal.side == "BUY":
         cash -= notional
         position += proposal.quantity
-    elif proposal.side == "SELL":
+    else:
         cash += notional
         position -= proposal.quantity
-    else:
-        raise ValueError(f"unknown side {proposal.side}")
     cash -= fee
-    return cash, position, fee, abs(notional)
+    return cash, position, fee, abs(notional), slippage_cost, execution_price
 
 
 def run_backtest(
@@ -193,14 +216,15 @@ def run_backtest(
 ) -> BacktestResult:
     """Run a deterministic candle-level adaptive-grid simulation.
 
-    The engine intentionally models only linear PnL, fees, funding and inventory.
-    It does not model liquidation/margin mechanics and therefore must not be used
-    as evidence that leveraged live trading is safe. Orders are repriced at each
-    bar boundary. Only information from already-closed bars is used to construct
-    the next bar's grid, avoiding look-ahead in regime classification.
+    The engine models linear PnL, fees, funding, conservative fill uncertainty,
+    adverse execution-cost stress, coarse decision latency and inventory. It does
+    not model liquidation/margin mechanics and therefore must not be used as
+    evidence that leveraged live trading is safe. Orders are repriced at each bar
+    boundary. Only already-closed bars are used for each decision.
     """
     _validate_config(config)
-    if len(candles) < regime_config.lookback + 1:
+    minimum_candles = regime_config.lookback + config.decision_latency_bars + 1
+    if len(candles) < minimum_candles:
         raise ValueError("insufficient candles for backtest")
     for candle in candles:
         if not all(_finite(v) and v > 0 for v in (candle.open, candle.high, candle.low, candle.close)):
@@ -222,14 +246,16 @@ def run_backtest(
     max_abs_inventory = Decimal("0")
     total_fees = Decimal("0")
     total_funding = Decimal("0")
+    total_slippage = Decimal("0")
     turnover = Decimal("0")
     fills: list[Fill] = []
     equity_curve: list[EquityPoint] = []
 
-    first_execution_index = regime_config.lookback
+    first_execution_index = regime_config.lookback + config.decision_latency_bars
     for index in range(first_execution_index, len(candles)):
         execution_bar = candles[index]
-        history = candles[index - regime_config.lookback:index]
+        decision_end = index - config.decision_latency_bars
+        history = candles[decision_end - regime_config.lookback:decision_end]
         assessment = assess_market_regime(history, regime_config)
         reference = history[-1].close
         best_bid, best_ask = _synthetic_bba(reference, config.synthetic_spread_bps)
@@ -276,15 +302,17 @@ def run_backtest(
             candidate_position = position + signed_qty
             if abs(candidate_position) > config.max_inventory:
                 continue
-            cash, position, fee, fill_turnover = _apply_fill(
+            cash, position, fee, fill_turnover, slippage_cost, execution_price = _apply_fill(
                 cash=cash,
                 position=position,
                 proposal=proposal,
                 fee_rate=config.fee_rate,
+                slippage_bps=config.slippage_bps,
             )
             total_fees += fee
+            total_slippage += slippage_cost
             turnover += fill_turnover
-            fills.append(Fill(index, proposal.side, proposal.price, proposal.quantity, fee))
+            fills.append(Fill(index, proposal.side, execution_price, proposal.quantity, fee))
             max_abs_inventory = max(max_abs_inventory, abs(position))
 
         funding_payment = position * execution_bar.close * funding_rates[index]
@@ -316,6 +344,7 @@ def run_backtest(
         max_abs_inventory=max_abs_inventory,
         total_fees=total_fees,
         total_funding=total_funding,
+        total_slippage=total_slippage,
         turnover=turnover,
         fill_count=len(fills),
         bars_processed=len(equity_curve),
