@@ -48,6 +48,41 @@ def _book_ticker(adapter):
     )
 
 
+def _created_order_snapshot(adapter, cids):
+    """Query only APGE orders created by this validator.
+
+    The function is deliberately strict: missing/invalid cumulative fill data is
+    not interpreted as zero.
+    """
+    snapshot = {}
+    for cid in sorted(cids):
+        info = adapter.query_order(SYMBOL, cid)
+        status = str(info.get("status", "UNKNOWN"))
+        raw_executed = info.get("executedQty")
+        try:
+            executed = Decimal(str(raw_executed))
+        except Exception as exc:
+            raise RuntimeError(f"invalid executedQty for {cid}") from exc
+        if executed.is_nan() or executed.is_infinite() or executed < 0:
+            raise RuntimeError(f"invalid executedQty for {cid}")
+        snapshot[cid] = {
+            "status": status,
+            "executedQty": str(executed),
+            "orderId": info.get("orderId"),
+        }
+    return snapshot
+
+
+def _reconcile(runtime, reconciler, risk):
+    risk.restore_connection()
+    if not reconciler.resolve_state(SYMBOL):
+        raise RuntimeError("reconciliation failed")
+    runtime.current_inventory = reconciler.last_position_amount
+    risk.complete_reconciliation()
+    if risk.system_state != SystemState.OPERATIONAL:
+        raise RuntimeError("RiskEngine did not return to OPERATIONAL after reconciliation")
+
+
 def main() -> int:
     api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "")
     api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET", "")
@@ -77,6 +112,7 @@ def main() -> int:
         "market_order_used": False,
         "leverage_changed": False,
         "margin_mode_changed": False,
+        "unexpected_fill": False,
     }
 
     try:
@@ -152,50 +188,91 @@ def main() -> int:
         if any(not cid.startswith("APGE_") for cid in cids1):
             raise RuntimeError("non-APGE CID created")
 
+        buy_row = next(row for row in active1 if row["side"] == "BUY")
+        sell_row = next(row for row in active1 if row["side"] == "SELL")
+        result.update({
+            "grid_buy_cid": buy_row["client_order_id"],
+            "grid_buy_price": str(buy_row["price"]),
+            "grid_buy_qty": str(buy_row["quantity"]),
+            "grid_sell_cid": sell_row["client_order_id"],
+            "grid_sell_price": str(sell_row["price"]),
+            "grid_sell_qty": str(sell_row["quantity"]),
+        })
+
         exchange1 = adapter.get_open_orders(symbol=SYMBOL)
         exchange_cids1 = {str(row.get("clientOrderId", "")) for row in exchange1}
-        if not cids1.issubset(exchange_cids1):
-            raise RuntimeError("exchange open orders do not contain both local APGE intents")
+        missing_created = cids1 - exchange_cids1
 
-        # Repeat the unchanged snapshot. No duplicate order may be created.
-        runtime.run_grid_cycle(
-            grid_spacing=spacing,
-            base_size=base_size,
-            level_count=1,
-            max_inventory=base_size,
-            system_state=risk.system_state,
-            market_regime=MarketRegime.NEUTRAL,
-            execution_engine=execution,
-        )
-        active2 = db.get_active_intents()
-        cids2 = {row["client_order_id"] for row in active2}
-        if cids2 != cids1 or len(active2) != 2:
-            raise RuntimeError("duplicate-cycle invariant failed")
-        result["duplicate_cycle_new_submissions"] = 0
+        if missing_created:
+            # An order may have filled between submission and the open-order read.
+            # Do not submit replacement exposure. Query authoritative state,
+            # reconcile, then clean only the remaining APGE orders.
+            snapshot = _created_order_snapshot(adapter, cids1)
+            result["created_order_snapshot_after_unexpected_event"] = snapshot
+            statuses = {row["status"] for row in snapshot.values()}
+            if not statuses.issubset({"NEW", "PARTIALLY_FILLED", "FILLED", "CANCELED"}):
+                raise RuntimeError("created order entered unknown/unsupported state")
+            if not any(
+                row["status"] in {"PARTIALLY_FILLED", "FILLED"}
+                and Decimal(row["executedQty"]) > 0
+                for row in snapshot.values()
+            ):
+                raise RuntimeError("created order missing from open orders without authoritative fill evidence")
+            result["unexpected_fill"] = True
+            result["duplicate_cycle_new_submissions"] = None
+            result["duplicate_cycle_skipped_reason"] = "unexpected fill/event; replacement grid forbidden"
+            _reconcile(runtime, reconciler, risk)
+        else:
+            # Repeat the unchanged snapshot. No duplicate order may be created.
+            runtime.run_grid_cycle(
+                grid_spacing=spacing,
+                base_size=base_size,
+                level_count=1,
+                max_inventory=base_size,
+                system_state=risk.system_state,
+                market_regime=MarketRegime.NEUTRAL,
+                execution_engine=execution,
+            )
+            active2 = db.get_active_intents()
+            cids2 = {row["client_order_id"] for row in active2}
+            if cids2 != cids1 or len(active2) != 2:
+                raise RuntimeError("duplicate-cycle invariant failed")
+            result["duplicate_cycle_new_submissions"] = 0
 
-        # Cleanup only the two APGE orders created by this validation.
-        for cid in sorted(cids1):
+        # Cleanup only APGE orders created by this validation and still active.
+        # Never cancel unrelated exchange orders.
+        open_now = adapter.get_open_orders(symbol=SYMBOL)
+        created_open_cids = {
+            str(row.get("clientOrderId", ""))
+            for row in open_now
+            if str(row.get("clientOrderId", "")) in cids1
+        }
+        for cid in sorted(created_open_cids):
             try:
                 execution.cancel_order(SYMBOL, cid)
             except Exception:
-                # A fill/cancel race is never guessed. Reconcile instead.
                 risk.restore_connection()
 
         if risk.system_state != SystemState.OPERATIONAL:
-            if not reconciler.resolve_state(SYMBOL):
-                raise RuntimeError("post-cancel reconciliation failed")
-            runtime.current_inventory = reconciler.last_position_amount
-            risk.complete_reconciliation()
+            _reconcile(runtime, reconciler, risk)
+        else:
+            # A terminal fill/cancel can race after the last open-order read.
+            # One final authoritative reconciliation prevents stale local state.
+            _reconcile(runtime, reconciler, risk)
 
         exchange_final = adapter.get_open_orders(symbol=SYMBOL)
-        final_apge = [row for row in exchange_final if str(row.get("clientOrderId", "")).startswith("APGE_")]
-        local_final = db.get_active_intents()
+        final_apge = [
+            row for row in exchange_final
+            if str(row.get("clientOrderId", "")) in cids1
+        ]
+        local_final = [
+            row for row in db.get_active_intents()
+            if row["client_order_id"] in cids1
+        ]
         positions_final = adapter.get_positions()
         final_position = _btc_position(positions_final)
 
         result.update({
-            "grid_buy_cid": next(row["client_order_id"] for row in active1 if row["side"] == "BUY"),
-            "grid_sell_cid": next(row["client_order_id"] for row in active1 if row["side"] == "SELL"),
             "final_exchange_open_apge_orders": len(final_apge),
             "final_local_active_intents": len(local_final),
             "final_reservations": str(risk.reservations),
