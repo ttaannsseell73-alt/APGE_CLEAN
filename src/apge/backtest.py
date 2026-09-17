@@ -21,6 +21,10 @@ class BacktestConfig:
     synthetic_spread_bps: Decimal = Decimal("2")
     fee_rate: Decimal = Decimal("0.0002")
     conservative_dual_touch: bool = True
+    # Require the bar to trade through a resting limit by this many basis points
+    # before granting a fill. Zero preserves the original touch model. Positive
+    # values are useful for conservative queue/fill-uncertainty stress tests.
+    fill_confirmation_bps: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -74,6 +78,7 @@ def _validate_config(config: BacktestConfig) -> None:
         config.min_notional,
         config.synthetic_spread_bps,
         config.fee_rate,
+        config.fill_confirmation_bps,
     )
     if any(not _finite(value) for value in decimal_values):
         raise ValueError("backtest configuration must contain finite Decimals")
@@ -87,6 +92,8 @@ def _validate_config(config: BacktestConfig) -> None:
         raise ValueError("minimums and fee rate cannot be negative")
     if config.synthetic_spread_bps <= 0:
         raise ValueError("synthetic spread must be positive")
+    if config.fill_confirmation_bps < 0 or config.fill_confirmation_bps >= Decimal("10000"):
+        raise ValueError("fill confirmation must be in [0, 10000) bps")
     if config.level_count <= 0:
         raise ValueError("level count must be positive")
 
@@ -111,11 +118,16 @@ def _filter_proposals(proposals: Iterable[OrderProposal], config: BacktestConfig
     return valid
 
 
-def _touched(proposal: OrderProposal, bar: Candle) -> bool:
+def _touched(proposal: OrderProposal, bar: Candle, confirmation_bps: Decimal) -> bool:
+    fraction = confirmation_bps / Decimal("10000")
     if proposal.side == "BUY":
-        return bar.low <= proposal.price
+        # A conservative BUY fill requires the market to trade below the limit,
+        # not merely print the exact limit, when confirmation_bps > 0.
+        threshold = proposal.price * (Decimal("1") - fraction)
+        return bar.low <= threshold
     if proposal.side == "SELL":
-        return bar.high >= proposal.price
+        threshold = proposal.price * (Decimal("1") + fraction)
+        return bar.high >= threshold
     raise ValueError(f"unknown side {proposal.side}")
 
 
@@ -124,8 +136,9 @@ def _select_fills(
     bar: Candle,
     current_position: Decimal,
     conservative_dual_touch: bool,
+    fill_confirmation_bps: Decimal = Decimal("0"),
 ) -> list[OrderProposal]:
-    touched = [proposal for proposal in proposals if _touched(proposal, bar)]
+    touched = [proposal for proposal in proposals if _touched(proposal, bar, fill_confirmation_bps)]
     if not conservative_dual_touch:
         return touched
 
@@ -250,7 +263,13 @@ def run_backtest(
             inventory_skew_strength=decision.inventory_skew_strength,
         )
         proposals = _filter_proposals(proposals, config)
-        selected = _select_fills(proposals, execution_bar, position, config.conservative_dual_touch)
+        selected = _select_fills(
+            proposals,
+            execution_bar,
+            position,
+            config.conservative_dual_touch,
+            config.fill_confirmation_bps,
+        )
 
         for proposal in selected:
             signed_qty = proposal.quantity if proposal.side == "BUY" else -proposal.quantity
