@@ -28,8 +28,13 @@ class BinanceAdapter:
     """Binance USD-M Futures TESTNET exchange adapter.
 
     The adapter is deliberately pinned to TESTNET hosts. It exposes no market
-    order, leverage-change or margin-mode mutation method.
+    order, leverage-change or margin-mode mutation method. Read-only market-data
+    methods are used by the deterministic adaptive controller.
     """
+
+    _KLINE_INTERVALS = {
+        "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"
+    }
 
     def __init__(self, transport: Transport, http_url: str, ws_url: str, api_key: str, api_secret: str, clock=None):
         parsed_http = urllib.parse.urlparse(http_url)
@@ -78,6 +83,12 @@ class BinanceAdapter:
             raise ValueError("listenKey is malformed")
         return listen_key
 
+    @staticmethod
+    def _validate_symbol(symbol: str) -> str:
+        if not isinstance(symbol, str) or not symbol or not symbol.isalnum():
+            raise ValueError("symbol must be a non-empty alphanumeric string")
+        return symbol.upper()
+
     def _prepare_signed_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         params_copy = dict(params)
         if "timestamp" not in params_copy:
@@ -94,6 +105,31 @@ class BinanceAdapter:
 
     def get_exchange_info(self) -> Dict[str, Any]:
         return self.transport.get(f"{self.http_url}/fapi/v1/exchangeInfo")
+
+    def get_klines(self, symbol: str, interval: str = "5m", limit: int = 100) -> List[List[Any]]:
+        """Fetch read-only USD-M kline rows from the TESTNET REST host."""
+        symbol = self._validate_symbol(symbol)
+        if interval not in self._KLINE_INTERVALS:
+            raise ValueError("unsupported kline interval")
+        if not isinstance(limit, int) or limit < 2 or limit > 1500:
+            raise ValueError("kline limit must be in [2, 1500]")
+        response = self.transport.get(
+            f"{self.http_url}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+        )
+        if not isinstance(response, list):
+            raise ValueError("invalid kline response")
+        return response
+
+    def get_premium_index(self, symbol: str) -> Dict[str, Any]:
+        """Fetch read-only mark/index/funding snapshot for a USD-M perpetual."""
+        symbol = self._validate_symbol(symbol)
+        response = self.transport.get(
+            f"{self.http_url}/fapi/v1/premiumIndex", params={"symbol": symbol}
+        )
+        if not isinstance(response, dict):
+            raise ValueError("invalid premium index response")
+        return response
 
     def get_positions(self) -> List[Dict[str, Any]]:
         params = self._prepare_signed_params({})
