@@ -101,6 +101,24 @@ def test_funding_is_applied_with_linear_perpetual_sign_convention():
     assert result.total_funding == expected
 
 
+def test_fill_confirmation_never_increases_fill_count_on_same_bars():
+    candles = _range_candles()
+    touch = run_backtest(candles, config=_config(fill_confirmation_bps=D("0")))
+    confirmed = run_backtest(candles, config=_config(fill_confirmation_bps=D("25")))
+    assert confirmed.fill_count <= touch.fill_count
+
+
+def test_invalid_fill_confirmation_fails_closed():
+    candles = _range_candles()
+    for value in (D("-1"), D("10000"), D("Infinity")):
+        try:
+            run_backtest(candles, config=_config(fill_confirmation_bps=value))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid fill confirmation must fail closed")
+
+
 def test_backtest_rejects_malformed_inputs():
     candles = _range_candles(25)
     bad = list(candles)
