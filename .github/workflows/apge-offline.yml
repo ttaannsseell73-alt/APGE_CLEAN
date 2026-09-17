@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - apge-03-controlled-grid-validation
+      - apge-prelive-completion-v1
   pull_request:
     branches:
       - main
+      - apge-03-controlled-grid-validation
 
 permissions:
   contents: read
