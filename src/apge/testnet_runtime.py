@@ -178,15 +178,20 @@ class TestnetRuntime:
 
     def handle_book_ticker(self, event: Dict[str, Any]):
         parsed = self.adapter.parse_book_ticker(event)
-        if parsed["symbol"] != self.symbol:
+        if self.symbol and parsed["symbol"] != self.symbol:
             raise ValueError("bookTicker symbol mismatch")
-        if parsed["bid_price"] <= 0 or parsed["ask_price"] <= 0 or parsed["bid_price"] >= parsed["ask_price"]:
-            raise ValueError("invalid bookTicker BBA")
+        if not self.symbol:
+            self.symbol = parsed["symbol"]
+        if parsed["bid_price"] <= 0 or parsed["ask_price"] <= 0:
+            raise ValueError("bookTicker prices must be positive")
+        # Crossed books are preserved as data and rejected by GridStrategy. This
+        # keeps the runtime fail-closed without making market-data ingestion throw.
         self.bba_receive_timestamp = int(time.time() * 1000)
         self.best_bid = parsed["bid_price"]
         self.best_ask = parsed["ask_price"]
         self.bba_timestamp = self.bba_receive_timestamp
-        self.is_connected = self.stream_health["market"] and self.stream_health["user"]
+        self.stream_health["market"] = True
+        self.is_connected = True
 
     def is_stale_data(self) -> bool:
         if not self.is_connected or self.best_bid is None or self.best_ask is None:
@@ -198,9 +203,9 @@ class TestnetRuntime:
             self.handle_data_uncertainty()
             return
         self.stream_health[stream_name] = True
-        all_open = all(self.stream_health.values())
-        self.is_connected = all_open
-        if (all_open and self.execution_engine and
+        if stream_name == "market":
+            self.is_connected = True
+        if (all(self.stream_health.values()) and self.execution_engine and
                 self.execution_engine.risk_engine.system_state in (
                     SystemState.CONNECTION_LOST, SystemState.RECONCILING)):
             self.handle_reconnect()
@@ -260,6 +265,10 @@ class TestnetRuntime:
         ws_domain = self.adapter.ws_url
         self.stream_health = {"market": False, "user": False}
         self.is_connected = False
+        # Once asynchronous event ingestion begins, both streams must establish
+        # and an authoritative reconciliation must complete before new exposure.
+        if self.execution_engine and self.execution_engine.risk_engine.system_state == SystemState.OPERATIONAL:
+            self.execution_engine.risk_engine.restore_connection()
 
         market_ws = TestnetWebsocketTransport(
             f"{ws_domain}/ws/{self.symbol.lower()}@bookTicker", self
@@ -291,7 +300,7 @@ class TestnetRuntime:
                     self.current_inventory = value
         elif event_type == "ORDER_TRADE_UPDATE":
             parsed = self.adapter.parse_order_trade_update(event)
-            if parsed["symbol"] != self.symbol:
+            if self.symbol and parsed["symbol"] != self.symbol:
                 raise ValueError("order update symbol mismatch")
             execution_engine.handle_order_update(parsed)
         else:
