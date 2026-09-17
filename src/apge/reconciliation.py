@@ -2,12 +2,12 @@ from typing import Dict, Any, List, Optional
 from decimal import Decimal
 
 from apge.persistence import Persistence
-from apge.binance_adapter import BinanceAdapter
+from apge.exchange import ExchangeAdapter
 from apge.simulator import OrderState, RiskEngine
 
 
 class Reconciler:
-    def __init__(self, persistence: Persistence, adapter: BinanceAdapter,
+    def __init__(self, persistence: Persistence, adapter: ExchangeAdapter,
                  risk_engine: Optional[RiskEngine] = None):
         self.persistence = persistence
         self.adapter = adapter
